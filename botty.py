@@ -36,7 +36,7 @@ class TestBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channel, nickname, server, port=6667):
         irc.bot.SingleServerIRCBot.__init__(self, [(server, port)], nickname, nickname)
         self.channel = channel
-        self.issue_regexp = re.compile(ur'(?:^|\s|pr|issue)\#(?P<num>[0-9]+)(?=(?:\s|$))', re.I)
+        self.issue_re = re.compile(ur'(?:^|\s|pr|issue|(?:(?P<user>[\w\.\-]+)/)?(?P<repo>[\w\.\-]+))?\#(?P<num>[0-9]+)(?=(?:\s|$))', re.I)
 
     def on_nicknameinuse(self, c, e):
         c.nick(c.get_nickname() + "_")
@@ -47,19 +47,27 @@ class TestBot(irc.bot.SingleServerIRCBot):
     def on_pubmsg(self, c, e):
         msgs = e.arguments
         for msg in msgs:
-            for ans in self.issue_regexp.findall(msg):
-                req = requests.get(u'https://github.com/neomutt/neomutt/issues/' + ans)
-                if req.status_code == 200:
-                    title = html.fromstring(req.content).xpath('//span[@class="js-issue-title"]/text()')[0].strip()
-                    val = req.url.split('/')[5]
-                    if val == u'pull':
-                        val = u'PR "' + title + u'": '
-                    elif val == u'issues':
-                        val = u'Issue "' + title + u'": '
-                    else:
-                        val += u' "' + title + u'": '
-                    c.privmsg(self.channel, val + req.url)
+            for user, repo, num in self.issue_re.findall(msg):
+                self.check_num(c, num, user, repo)
         return
+
+    def check_num(self, c, num, user, repo):
+        if user == u'':
+            user = u'neomutt'
+        if repo == u'':
+            repo = u'neomutt'
+        url = u'https://github.com/' + user + u'/' + repo + u'/issues/' + num
+        req = requests.get(url)
+        if req.status_code == 200:
+            title = html.fromstring(req.content).xpath('//span[@class="js-issue-title"]/text()')[0].strip()
+            val = req.url.split('/')[5]
+            if val == u'pull':
+                val = u'PR "' + title + u'": '
+            elif val == u'issues':
+                val = u'Issue "' + title + u'": '
+            else:
+                val += u' "' + title + u'": '
+            c.privmsg(self.channel, val + req.url)
 
 def main():
     import sys
