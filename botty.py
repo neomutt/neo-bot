@@ -36,7 +36,7 @@ class TestBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channel, nickname, server, port=6667):
         irc.bot.SingleServerIRCBot.__init__(self, [(server, port)], nickname, nickname)
         self.channel = channel
-        self.issue_re = re.compile(ur'(?:^|\s|pr|issue|(?:(?P<user>[\w\.\-]+)/)?(?P<repo>[\w\.\-]+))?\#(?P<num>[0-9]+)(?=(?:\s|$))', re.I)
+        self.issue_re = re.compile(ur'(?:^|\s|pr|issue|(?:(?P<user>[\w\.\-]+)/)?(?P<repo>[\w\.\-]+))?\#(?P<num>[0-9]+)\b', re.I)
 
     def on_nicknameinuse(self, c, e):
         c.nick(c.get_nickname() + "_")
