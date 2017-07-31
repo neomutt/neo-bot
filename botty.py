@@ -31,6 +31,7 @@ from irc.client import ip_numstr_to_quad, ip_quad_to_numstr
 import re
 import requests
 from lxml import html
+import time
 
 class TestBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channel, nickname, server, port=6667):
@@ -50,6 +51,38 @@ class TestBot(irc.bot.SingleServerIRCBot):
             for user, repo, num in self.issue_re.findall(msg):
                 self.check_num(c, num, user, repo)
         return
+
+    def on_kick(self, c, e):
+        print("Parted by ")
+        print(e)
+        delay = 10
+        time.sleep(delay)
+        while True:
+            try:
+                print("... rejoining")
+                c.join(self.channel)
+                break
+            except:
+                delay = 2 * delay
+                if delay > 300:
+                    delay = 300
+                time.sleep(delay)
+
+    def on_disconnect(self, c, e):
+        print("Disconnected by ")
+        print(e)
+        delay = 10
+        time.sleep(delay)
+        while True:
+            try:
+                print("... reconnecting")
+                c.reconnect()
+                break
+            except:
+                delay = 2 * delay
+                if delay > 300:
+                    delay = 300
+                time.sleep(delay)
 
     def check_num(self, c, num, user, repo):
         if user == u'':
