@@ -32,15 +32,21 @@ import re
 import requests
 from lxml import html
 import time
+from datetime import datetime, timedelta
 
 class TestBot(irc.bot.SingleServerIRCBot):
-    def __init__(self, channel, nickname, server, port=6667):
+    def __init__(self, channel, nickname, server, port, user, repo, max_age):
         irc.bot.SingleServerIRCBot.__init__(self, [(server, port)], nickname, nickname)
         self.channel = channel
         self.issue_re = re.compile(ur'(?:^|\s|pr|issue|(?:(?P<user>[\w\.\-]+)/)?(?P<repo>[\w\.\-]+))?\#(?P<num>[0-9]+)\b', re.I)
+        self.user = user
+        self.repo = repo
+        self.max_age = timedelta(days=max_age)
+        self.nickname = nickname
 
     def on_nicknameinuse(self, c, e):
         c.nick(c.get_nickname() + "_")
+        self.nickname = c.get_nickname()
 
     def on_welcome(self, c, e):
         c.join(self.channel)
@@ -49,7 +55,10 @@ class TestBot(irc.bot.SingleServerIRCBot):
         msgs = e.arguments
         for msg in msgs:
             for user, repo, num in self.issue_re.findall(msg):
-                self.check_num(c, num, user, repo)
+                if msg.startswith(self.nickname):
+                    self.check_num(c, num, user, repo, True)
+                else:
+                    self.check_num(c, num, user, repo, False)
         return
 
     def on_kick(self, c, e):
@@ -84,15 +93,22 @@ class TestBot(irc.bot.SingleServerIRCBot):
                     delay = 300
                 time.sleep(delay)
 
-    def check_num(self, c, num, user, repo):
+    def check_num(self, c, num, user, repo, force):
         if user == u'':
-            user = u'neomutt'
+            user = self.user
         if repo == u'':
-            repo = u'neomutt'
+            repo = self.repo
+
         url = u'https://github.com/' + user + u'/' + repo + u'/issues/' + num
         req = requests.get(url)
         if req.status_code == 200:
-            title = html.fromstring(req.content).xpath('//span[@class="js-issue-title"]/text()')[0].strip()
+            content = html.fromstring(req.content)
+
+            date = content.xpath('//h3[@class="timeline-comment-header-text f5 text-normal"]/a[@class="timestamp"]/relative-time')[-1].attrib['datetime']
+            date = datetime.strptime(date, '%Y-%m-%dT%H:%M:%SZ')
+
+            title = content.xpath('//span[@class="js-issue-title"]/text()')[0].strip()
+
             val = req.url.split('/')[5]
             if val == u'pull':
                 val = u'PR "' + title + u'": '
@@ -100,28 +116,28 @@ class TestBot(irc.bot.SingleServerIRCBot):
                 val = u'Issue "' + title + u'": '
             else:
                 val += u' "' + title + u'": '
-            c.privmsg(self.channel, val + req.url)
+
+            if force or date + self.max_age > datetime.now():
+                c.privmsg(self.channel, val + req.url)
 
 def main():
     import sys
-    if len(sys.argv) != 4:
-        print("Usage: testbot <server[:port]> <channel> <nickname>")
-        sys.exit(1)
+    import argparse
 
-    s = sys.argv[1].split(":", 1)
-    server = s[0]
-    if len(s) == 2:
-        try:
-            port = int(s[1])
-        except ValueError:
-            print("Error: Erroneous port.")
-            sys.exit(1)
-    else:
-        port = 6667
-    channel = sys.argv[2]
-    nickname = sys.argv[3]
+    parser = argparse.ArgumentParser()
 
-    bot = TestBot(channel, nickname, server, port)
+    parser.add_argument('server', help='IRC server to connect to')
+    parser.add_argument('channel', help='IRC channel to join')
+    parser.add_argument('nickname', help='nickname to use')
+
+    parser.add_argument('-p', '--port', help='port of the IRC server', type=int, default=6667)
+    parser.add_argument('-u', '--user', help='default github user', default=u'neomutt')
+    parser.add_argument('-r', '--repo', help='default github repository', default=u'neomutt')
+    parser.add_argument('-m', '--max_age', help='only show issues less than MAX_AGE days old', type=int, default=365)
+
+    args = parser.parse_args()
+
+    bot = TestBot(args.channel, args.nickname, args.server, args.port, args.user, args.repo, args.max_age)
     bot.start()
 
 if __name__ == "__main__":
