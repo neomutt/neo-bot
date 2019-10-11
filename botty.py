@@ -104,10 +104,12 @@ class TestBot(irc.bot.SingleServerIRCBot):
         if req.status_code == 200:
             content = html.fromstring(req.content)
 
-            date = content.xpath('//h3[@class="timeline-comment-header-text f5 text-normal"]/a[@class="timestamp"]/relative-time')[-1].attrib['datetime']
+            date = content.xpath('//h3[@class="timeline-comment-header-text f5 text-normal"]/a[@class="link-gray js-timestamp"]/relative-time')[0].attrib['datetime']
+            print date
             date = datetime.strptime(date, '%Y-%m-%dT%H:%M:%SZ')
 
             title = content.xpath('//span[@class="js-issue-title"]/text()')[0].strip()
+            print title
 
             val = req.url.split('/')[5]
             if val == u'pull':
@@ -118,7 +120,10 @@ class TestBot(irc.bot.SingleServerIRCBot):
                 val += u' "' + title + u'": '
 
             if force or date + self.max_age > datetime.now():
+                print "SENT: " + val + req.url
                 c.privmsg(self.channel, val + req.url)
+            else:
+                print "NOT SENT:" + val + req.url
 
 def main():
     import sys
