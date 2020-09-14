@@ -38,7 +38,7 @@ class TestBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channel, nickname, server, port, user, repo, max_age):
         irc.bot.SingleServerIRCBot.__init__(self, [(server, port)], nickname, nickname)
         self.channel = channel
-        self.issue_re = re.compile(ur'(?:^|\s|pr|issue|(?:(?P<user>[\w\.\-]+)/)?(?P<repo>[\w\.\-]+))?\#(?P<num>[0-9]+)\b', re.I)
+        self.issue_re = re.compile(r'(?:^|\s|pr|issue|(?:(?P<user>[\w\.\-]+)/)?(?P<repo>[\w\.\-]+))?\#(?P<num>[0-9]+)\b', re.I)
         self.user = user
         self.repo = repo
         self.max_age = timedelta(days=max_age)
@@ -94,36 +94,36 @@ class TestBot(irc.bot.SingleServerIRCBot):
                 time.sleep(delay)
 
     def check_num(self, c, num, user, repo, force):
-        if user == u'':
+        if user == '':
             user = self.user
-        if repo == u'':
+        if repo == '':
             repo = self.repo
 
-        url = u'https://github.com/' + user + u'/' + repo + u'/issues/' + num
+        url = 'https://github.com/' + user + '/' + repo + '/issues/' + num
         req = requests.get(url)
         if req.status_code == 200:
             content = html.fromstring(req.content)
 
             date = content.xpath('//h3[@class="timeline-comment-header-text f5 text-normal"]/a[@class="link-gray js-timestamp"]/relative-time')[0].attrib['datetime']
-            print date
+            print(date)
             date = datetime.strptime(date, '%Y-%m-%dT%H:%M:%SZ')
 
             title = content.xpath('//span[@class="js-issue-title"]/text()')[0].strip()
-            print title
+            print(title)
 
             val = req.url.split('/')[5]
-            if val == u'pull':
-                val = u'PR "' + title + u'": '
-            elif val == u'issues':
-                val = u'Issue "' + title + u'": '
+            if val == 'pull':
+                val = 'PR "' + title + '": '
+            elif val == 'issues':
+                val = 'Issue "' + title + '": '
             else:
-                val += u' "' + title + u'": '
+                val += ' "' + title + '": '
 
             if force or date + self.max_age > datetime.now():
-                print "SENT: " + val + req.url
+                print("SENT: " + val + req.url)
                 c.privmsg(self.channel, val + req.url)
             else:
-                print "NOT SENT:" + val + req.url
+                print("NOT SENT:" + val + req.url)
 
 def main():
     import sys
@@ -136,8 +136,8 @@ def main():
     parser.add_argument('nickname', help='nickname to use')
 
     parser.add_argument('-p', '--port', help='port of the IRC server', type=int, default=6667)
-    parser.add_argument('-u', '--user', help='default github user', default=u'neomutt')
-    parser.add_argument('-r', '--repo', help='default github repository', default=u'neomutt')
+    parser.add_argument('-u', '--user', help='default github user', default='neomutt')
+    parser.add_argument('-r', '--repo', help='default github repository', default='neomutt')
     parser.add_argument('-m', '--max_age', help='only show issues less than MAX_AGE days old', type=int, default=365)
 
     args = parser.parse_args()
