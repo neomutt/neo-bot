@@ -112,6 +112,16 @@ class TestBot(irc.bot.SingleServerIRCBot):
         if req.status_code == 200:
             content = html.fromstring(req.content)
 
+            maybe_deleted_h3 = content.xpath(
+                '//div[normalize-space(@class)="repository-content"]//h3'
+            )
+            if (
+                maybe_deleted_h3
+                and maybe_deleted_h3[0].text == "This issue has been deleted."
+            ):
+                c.privmsg(answer_to, "The issue {} has been deleted".format(num))
+                return
+
             date = content.xpath(
                 '//h3[@class="timeline-comment-header-text f5'
                 ' text-normal"]/a[@class="link-gray js-timestamp"]/relative-time'
