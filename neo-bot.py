@@ -31,10 +31,16 @@ import re
 import requests
 import time
 from datetime import datetime, timedelta
-from collections import namedtuple
+from dataclasses import dataclass
 
-Issue = namedtuple('Issue', 'date type user title url deleted')
-
+@dataclass
+class Issue:
+    date:    datetime
+    type:     str
+    user:    str
+    title:   str
+    url:     str
+    deleted: bool
 
 class TestBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channel, nickname, server, port, user, repo, max_age):
@@ -123,7 +129,7 @@ class TestBot(irc.bot.SingleServerIRCBot):
         req = requests.get(
             f"https://api.github.com/repos/{user}/{repo}/issues/{num}")
         if req.status_code == 410:
-            return Issue(None, None, None, None, None, True)
+            return Issue(deleted=True)
 
         elif req.status_code == 200:
             issue = req.json()
@@ -132,7 +138,7 @@ class TestBot(irc.bot.SingleServerIRCBot):
             url = issue["url"]
             user = issue["user"]["login"]
             type = "PR" if "pull_request" in issue else "Issue"
-            return Issue(date, type, user, title, url, False)
+            return Issue(date=date, type=type, user=user, title=title, url=url, deleted=False)
 
         else:
             return None
