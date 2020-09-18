@@ -135,10 +135,12 @@ class TestBot(irc.bot.SingleServerIRCBot):
             issue = req.json()
             date = datetime.strptime(issue["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
             title = issue["title"]
-            url = issue["url"]
+            url = issue["html_url"]
             user = issue["user"]["login"]
             type = "PR" if "pull_request" in issue else "Issue"
-            return Issue(date=date, type=type, user=user, title=title, url=url, deleted=False)
+            return Issue(
+                date=date, type=type, user=user, title=title, url=url, deleted=False
+            )
 
         else:
             return None
