@@ -74,19 +74,23 @@ class TestBot(irc.bot.SingleServerIRCBot):
             for user, repo, num in self.issue_re.findall(msg):
                 issue = self.check_num(num, user, repo)
                 if issue is None:
-                    # Not Found
+                    print(f"Issue {num} not found")
                     continue
 
                 is_private = msg.startswith(self.nickname)
 
                 if issue.deleted:
                     c.privmsg(answer_to, f"The issue {num} has been deleted")
+                    print(f"The issue {num} has been deleted")
                     continue
 
                 is_old = (issue.date + self.max_age) <= datetime.now()
                 reply = f'{issue.type} by @{issue.user} "{issue.title}": {issue.url}'
                 if not is_old or (is_old and is_private):
                     c.privmsg(answer_to, reply)
+                    print("SENT: " + reply)
+                else:
+                    print("NOT SENT: " + reply)
 
     def on_kick(self, c, e):
         print("Parted by ")
