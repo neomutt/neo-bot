@@ -37,6 +37,6 @@ optional arguments:
 ### Example:
 
 ```bash
-./neo-bot.py irc.freenode.net neomutt neo-bot
+./neo-bot.py irc.libera.chat neomutt neo-bot
 ```
 
