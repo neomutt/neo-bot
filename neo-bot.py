@@ -1,32 +1,35 @@
 #! /usr/bin/env python
 # Joel Rosdahl <joel@rosdahl.net>
 
-import irc.bot
-import irc.strings
+import argparse
 import re
-import requests
 import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
+import irc.bot
+import irc.strings
+import requests
 
-@dataclass
-class Issue:
-    date: datetime
-    type: str
-    user: str
-    title: str
-    url: str
-    deleted: bool
+import queries
 
 
-class TestBot(irc.bot.SingleServerIRCBot):
-    def __init__(self, channel, nickname, server, port, user, repo, max_age):
+class GitHubBot(irc.bot.SingleServerIRCBot):
+    def __init__(self, api, channel, nickname, server, port, user, repo, max_age):
         super().__init__(((server, port),), nickname, nickname)
+        self.api = api
         self.channel = channel
         self.issue_re = re.compile(
-            r"(?:^|\s|pr|issue|(?:(?P<user>[\w\.\-]+)/)?(?P<repo>[\w\.\-]+))?\#(?P<num>[0-9]+)\b",
-            re.I,
+            r"""
+            (?:^|\s) # boundary must be space or start of line
+            (?:
+                (?:(?P<user>[\w\.\-]+)/)? # Optional user, if present must end in slash
+                (?P<repo>[\w\.\-]+) # repo
+            )? # optional, sane defaults are chosen if not provided
+            \#(?P<num>[0-9]+) # issue number
+            \b # followed by some word boundary (punctuation, space...)
+        """,
+            re.IGNORECASE | re.VERBOSE,
         )
         self.user = user
         self.repo = repo
@@ -50,25 +53,25 @@ class TestBot(irc.bot.SingleServerIRCBot):
         msgs = e.arguments
         for msg in msgs:
             for user, repo, num in self.issue_re.findall(msg):
-                issue = self.check_num(num, user, repo)
-                if issue is None:
-                    print(f"Issue {num} not found")
+                try:
+                    entity = self.find_entity_from_id(num, user, repo)
+                except Exception as err:
+                    print(f"FAILURE: {err}")
+                    continue
+                if entity is None:
+                    print(f"Entity {num} not found")
                     continue
 
-                is_private = msg.startswith(self.nickname)
-
-                if issue.deleted:
-                    c.privmsg(answer_to, f"The issue {num} has been deleted")
-                    print(f"The issue {num} has been deleted")
+                is_mention = msg.startswith(self.nickname)
+                is_old = (entity.date + self.max_age) <= datetime.now()
+                # if the bot is explicitly mentioned rather than just triggered passively
+                # ignore the max age option
+                if is_old and not is_mention:
+                    print(f"IGNORED: {num} is too old")
                     continue
-
-                is_old = (issue.date + self.max_age) <= datetime.now()
-                reply = f'{issue.type} by @{issue.user} "{issue.title}": {issue.url}'
-                if not is_old or (is_old and is_private):
-                    c.privmsg(answer_to, reply)
-                    print("SENT: " + reply)
-                else:
-                    print("NOT SENT: " + reply)
+                reply = entity.render()
+                c.privmsg(answer_to, reply)
+                print("SENT: " + reply)
 
     def on_kick(self, c, e):
         print("Parted by ")
@@ -102,34 +105,15 @@ class TestBot(irc.bot.SingleServerIRCBot):
                     delay = 300
                 time.sleep(delay)
 
-    def check_num(self, num, user=None, repo=None):
+    def find_entity_from_id(self, num, user=None, repo=None):
         if not user:
             user = self.user
         if not repo:
             repo = self.repo
-
-        req = requests.get(f"https://api.github.com/repos/{user}/{repo}/issues/{num}")
-        if req.status_code == 410:
-            return Issue(deleted=True)
-
-        elif req.status_code == 200:
-            issue = req.json()
-            date = datetime.strptime(issue["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
-            title = issue["title"]
-            url = issue["html_url"]
-            user = issue["user"]["login"]
-            type = "PR" if "pull_request" in issue else "Issue"
-            return Issue(
-                date=date, type=type, user=user, title=title, url=url, deleted=False
-            )
-
-        else:
-            return None
+        return self.api.find_by_id(num, user, repo)
 
 
-def main():
-    import argparse
-
+def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("server", help="IRC server to connect to")
@@ -151,10 +135,22 @@ def main():
         default=365,
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "-k",
+        "--api_token_path",
+        help="Path to file containing GH api key",
+        required=True,
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
     print(args)
 
-    bot = TestBot(
+    api = GitHubAPI(args.api_token_path)
+    bot = GitHubBot(
+        api,
         f"#{args.channel}",
         args.nickname,
         args.server,
@@ -164,6 +160,130 @@ def main():
         args.max_age,
     )
     bot.start()
+
+
+@dataclass
+class Issue:
+    user: str
+    title: str
+    url: str
+    date: datetime
+    deleted: bool = False
+
+    def render(self):
+        return f'Issue by @{self.user} "{self.title}": {self.url}'
+
+
+@dataclass
+class PullRequest:
+    title: str
+    url: str
+    user: str
+    date: datetime
+
+    def render(self):
+        return f'PR by @{self.user} "{self.title}": {self.url}'
+
+
+@dataclass
+class Discussion:
+    title: str
+    url: str
+    user: str
+    date: datetime
+    num_comments: int
+    category: str
+
+    def render(self):
+        if self.num_comments == 1:
+            comment_str = "comment"
+        else:
+            comment_str = "comments"
+
+        return (
+            f'{self.category} discussion by @{self.user} "{self.title}" '
+            f"with {self.num_comments} {comment_str}: {self.url}"
+        )
+
+
+class GitHubAPI:
+    _GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
+
+    def __init__(self, api_token_path, timeout_sec=5):
+        """Grahpql API of GitHub
+        Params:
+            api_token_path: Path to file containing GH api key.
+                            Needs at least the public_repo scope
+            timeout_sec: Default request timeout in seconds
+        """
+        api_key = self._load_api_key(api_token_path)
+        self._session = self._init_session(api_key)
+        self.timeout_sec = timeout_sec
+
+    def _load_api_key(self, api_token_path):
+        with open(api_token_path, "r") as file:
+            return file.readline().strip()
+
+    def _init_session(self, api_key):
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+
+    def query(self, query, variables=None):
+        resp = self.session.post(
+            self._GRAPHQL_ENDPOINT,
+            json={"query": query, "variables": variables},
+            timeout=self.timeout_sec,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def find_by_id(self, id_, user="neomutt", repo="neomutt"):
+        vars = {"num": int(id_), "user": user, "repo": repo}
+        res = self.query(queries.FETCH_ALL_BY_ID, vars)
+        data = res["data"]["repository"]
+        if issue := data["issue"]:
+            return Issue(
+                user=issue["author"]["login"],
+                title=issue["title"],
+                url=issue["url"],
+                date=format_time(issue["createdAt"]),
+            )
+        elif pr := data["pullRequest"]:
+            return PullRequest(
+                user=pr["author"]["login"],
+                title=pr["title"],
+                url=pr["url"],
+                date=format_time(pr["createdAt"]),
+            )
+        elif discussion := data["discussion"]:
+            return Discussion(
+                user=discussion["author"]["login"],
+                title=discussion["title"],
+                url=discussion["url"],
+                date=format_time(discussion["createdAt"]),
+                num_comments=discussion["comments"]["totalCount"],
+                category=self._emoji_from_emojiHTML(
+                    discussion["category"]["emojiHTML"]
+                ),
+            )
+        else:
+            # not found or someone forgot to update this function after modifying the
+            # graphql query
+            return
+
+    def _emoji_from_emojiHTML(self, emojiHTML):
+        # example category output of the graphql output:
+        #  '<div><g-emoji '
+        #  'class="g-emoji" '
+        #  'alias="wrench" '
+        #  'fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f527.png">🔧</g-emoji></div>'},
+        end = emojiHTML.rindex("</g-emoji>")  # the tag we actually wanna have
+        start = emojiHTML.rindex(">", 0, end) + 1  # we only want the inner text
+        return emojiHTML[start:end]
+
+
+def format_time(time):
+    return datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ")
 
 
 if __name__ == "__main__":
