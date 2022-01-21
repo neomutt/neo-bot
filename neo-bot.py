@@ -3,7 +3,6 @@
 # Example program using irc.bot.
 #
 # Joel Rosdahl <joel@rosdahl.net>
-
 """A simple example bot.
 
 This is an example bot that uses the SingleServerIRCBot class from
@@ -33,14 +32,16 @@ import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
+
 @dataclass
 class Issue:
-    date:    datetime
-    type:     str
-    user:    str
-    title:   str
-    url:     str
+    date: datetime
+    type: str
+    user: str
+    title: str
+    url: str
     deleted: bool
+
 
 class TestBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channel, nickname, server, port, user, repo, max_age):
@@ -130,8 +131,7 @@ class TestBot(irc.bot.SingleServerIRCBot):
         if not repo:
             repo = self.repo
 
-        req = requests.get(
-            f"https://api.github.com/repos/{user}/{repo}/issues/{num}")
+        req = requests.get(f"https://api.github.com/repos/{user}/{repo}/issues/{num}")
         if req.status_code == 410:
             return Issue(deleted=True)
 
@@ -162,8 +162,7 @@ def main():
     parser.add_argument(
         "-p", "--port", help="port of the IRC server", type=int, default=6667
     )
-    parser.add_argument(
-        "-u", "--user", help="default github user", default="neomutt")
+    parser.add_argument("-u", "--user", help="default github user", default="neomutt")
     parser.add_argument(
         "-r", "--repo", help="default github repository", default="neomutt"
     )
