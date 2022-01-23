@@ -1,0 +1,16 @@
+[Unit]
+Description=NeoMutt IRC Bot
+
+[Service]
+Type=simple
+Environment="PYTHONUNBUFFERED=TRUE"
+WorkingDirectory=/home/neo-bot/neo-bot
+ExecStartPre=/usr/bin/git pull
+ExecStart=/home/neo-bot/neo-bot/neo-bot.py irc.libera.chat neomutt neo-bot
+
+RestartSec=10
+Restart=always
+
+[Install]
+WantedBy=default.target
+
