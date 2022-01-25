@@ -1,0 +1,28 @@
+in neomutt channel "#3200"
+	on_pubmsg
+		self.channel	#neomutt-test
+		e.source.nick	flatcap
+		e.target	#neomutt-test
+		e.arguments	['#3200']
+
+in neomutt channel "neo-bot-flatcap: #3200"
+	on_pubmsg
+		self.channel	#neomutt-test
+		e.source.nick	flatcap
+		e.target	#neomutt-test
+		e.arguments	['neo-bot-flatcap: #3200']
+
+/msg bot #3200
+	on_privmsg
+		self.channel	#neomutt-test
+		e.source.nick	flatcap
+		e.target	neo-bot-flatcap
+		e.arguments	['#3200']
+
+in bot channel "#3200"
+	on_privmsg
+		self.channel	#neomutt-test
+		e.source.nick	flatcap
+		e.target	neo-bot-flatcap
+		e.arguments	['#3200']
+
