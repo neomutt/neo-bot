@@ -51,11 +51,11 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         c.join(self.channel)
 
     def on_privmsg(self, c, e):
-        c.privmsg(self.channel, f"PRIVMSG {self.channel} {e.source.nick}")
+        c.privmsg(self.channel, f"PRIVMSG {self.channel} source: {e.source.nick} target: {e.target} msg: {e.arguments}")
         return self._process_message(c, self.channel, e)
 
     def on_pubmsg(self, c, e):
-        c.privmsg(self.channel, f"PUBMSG {self.channel} {e.source.nick}")
+        c.privmsg(self.channel, f"PUBMSG {self.channel} source: {e.source.nick} target: {e.target} msg: {e.arguments}")
         return self._process_message(c, self.channel, e)
 
     def _apply_report_policies(self, msg, entity):
