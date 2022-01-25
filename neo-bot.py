@@ -51,9 +51,11 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         c.join(self.channel)
 
     def on_privmsg(self, c, e):
+        c.privmsg(self.channel, f"PRIVMSG {self.channel} {e.source.nick}")
         return self._process_message(c, self.channel, e)
 
     def on_pubmsg(self, c, e):
+        c.privmsg(self.channel, f"PUBMSG {self.channel} {e.source.nick}")
         return self._process_message(c, self.channel, e)
 
     def _apply_report_policies(self, msg, entity):
@@ -239,7 +241,6 @@ class Discussion:
     user: str
     date: datetime
     num_comments: int
-    category: str
 
     def render(self):
         if self.num_comments == 1:
@@ -248,7 +249,7 @@ class Discussion:
             comment_str = "comments"
 
         return (
-            f'{self.category} discussion by @{self.user} "{self.title}" '
+            f'Discussion by @{self.user} "{self.title}" '
             f"with {self.num_comments} {comment_str}: {self.url}"
         )
 
@@ -312,24 +313,11 @@ class GitHubAPI:
                 url=discussion["url"],
                 date=format_time(discussion["createdAt"]),
                 num_comments=discussion["comments"]["totalCount"],
-                category=self._emoji_from_emojiHTML(
-                    discussion["category"]["emojiHTML"]
-                ),
             )
         else:
             # not found or someone forgot to update this function after modifying the
             # graphql query
             return
-
-    def _emoji_from_emojiHTML(self, emojiHTML):
-        # example category output of the graphql output:
-        #  '<div><g-emoji '
-        #  'class="g-emoji" '
-        #  'alias="wrench" '
-        #  'fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f527.png">🔧</g-emoji></div>'},
-        end = emojiHTML.rindex("</g-emoji>")  # the tag we actually wanna have
-        start = emojiHTML.rindex(">", 0, end) + 1  # we only want the inner text
-        return emojiHTML[start:end]
 
 
 def format_time(time):
