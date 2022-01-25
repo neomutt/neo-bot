@@ -51,7 +51,7 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         c.join(self.channel)
 
     def on_privmsg(self, c, e):
-        return self._process_message(c, e.source.nick, e)
+        return self._process_message(c, self.channel, e)
 
     def on_pubmsg(self, c, e):
         return self._process_message(c, self.channel, e)
