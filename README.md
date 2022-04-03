@@ -25,6 +25,9 @@ positional arguments:
   channel               IRC channel to join
   nickname              nickname to use
 
+required arguments:
+  -k PATH, --api_token_path PATH Path to file containing the GitHub api key
+
 optional arguments:
   -h, --help            show this help message and exit
   -p PORT, --port PORT  port of the IRC server
@@ -39,4 +42,3 @@ optional arguments:
 ```bash
 ./neo-bot.py irc.libera.chat neomutt neo-bot
 ```
-
