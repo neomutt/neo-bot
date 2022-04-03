@@ -2,6 +2,7 @@ FETCH_ALL_BY_ID = """
 query ($num: Int!, $user: String = "neomutt", $repo: String = "neomutt") {
   repository(owner: $user, name: $repo) {
     issue(number: $num) {
+      number
       title
       url
       createdAt
@@ -10,6 +11,7 @@ query ($num: Int!, $user: String = "neomutt", $repo: String = "neomutt") {
       }
     }
     pullRequest(number: $num) {
+      number
       title
       url
       createdAt
@@ -18,6 +20,7 @@ query ($num: Int!, $user: String = "neomutt", $repo: String = "neomutt") {
       }
     }
     discussion(number: $num) {
+      number
       title
       url
       createdAt

@@ -164,6 +164,7 @@ def main():
 
 @dataclass
 class Issue:
+    number: int
     user: str
     title: str
     url: str
@@ -176,6 +177,7 @@ class Issue:
 
 @dataclass
 class PullRequest:
+    number: int
     title: str
     url: str
     user: str
@@ -187,6 +189,7 @@ class PullRequest:
 
 @dataclass
 class Discussion:
+    number: int
     title: str
     url: str
     user: str
@@ -243,6 +246,7 @@ class GitHubAPI:
         data = res["data"]["repository"]
         if issue := data["issue"]:
             return Issue(
+                number=issue["number"],
                 user=issue["author"]["login"],
                 title=issue["title"],
                 url=issue["url"],
@@ -250,6 +254,7 @@ class GitHubAPI:
             )
         elif pr := data["pullRequest"]:
             return PullRequest(
+                number=pr["number"],
                 user=pr["author"]["login"],
                 title=pr["title"],
                 url=pr["url"],
@@ -257,6 +262,7 @@ class GitHubAPI:
             )
         elif discussion := data["discussion"]:
             return Discussion(
+                number=discussion["number"],
                 user=discussion["author"]["login"],
                 title=discussion["title"],
                 url=discussion["url"],
