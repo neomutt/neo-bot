@@ -12,10 +12,13 @@ import irc.strings
 import requests
 
 import queries
+from maxageset import MaxAgeSet
 
 
 class GitHubBot(irc.bot.SingleServerIRCBot):
-    def __init__(self, api, channel, nickname, server, port, user, repo, max_age):
+    def __init__(
+        self, api, channel, nickname, server, port, user, repo, max_age, cooldown_min
+    ):
         super().__init__(((server, port),), nickname, nickname)
         self.api = api
         self.channel = channel
@@ -33,8 +36,12 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         )
         self.user = user
         self.repo = repo
-        self.max_age = timedelta(days=max_age)
         self.nickname = nickname
+        self.max_age = timedelta(days=max_age)
+        self.policies = [
+            self.reject_if_too_old(),
+            self.reject_if_repeated(timedelta(minutes=cooldown_min)),
+        ]
 
     def on_nicknameinuse(self, c, e):
         c.nick(c.get_nickname() + "_")
@@ -49,6 +56,14 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
     def on_pubmsg(self, c, e):
         return self._process_message(c, self.channel, e)
 
+    def _apply_report_policies(self, msg, entity):
+        """Returns None if the bot should reply and an error message otherwise"""
+        for f in self.policies:
+            resp = f(msg, entity)
+            if resp is not None:
+                return resp
+        return None
+
     def _process_message(self, c, answer_to, e):
         msgs = e.arguments
         for msg in msgs:
@@ -62,13 +77,11 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
                     print(f"Entity {num} not found")
                     continue
 
-                is_mention = msg.startswith(self.nickname)
-                is_old = (entity.date + self.max_age) <= datetime.now()
-                # if the bot is explicitly mentioned rather than just triggered passively
-                # ignore the max age option
-                if is_old and not is_mention:
-                    print(f"IGNORED: {num} is too old")
+                reject_reason = self._apply_report_policies(msg, entity)
+                if reject_reason is not None:
+                    print(reject_reason)
                     continue
+
                 reply = entity.render()
                 c.privmsg(answer_to, reply)
                 print("SENT: " + reply)
@@ -112,6 +125,30 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
             repo = self.repo
         return self.api.find_by_id(num, user, repo)
 
+    def reject_if_too_old(self):
+        def validate(msg, entity):
+            is_mention = msg.startswith(self.nickname)
+            is_old = (entity.date + self.max_age) <= datetime.now()
+            # if the bot is explicitly mentioned rather than just triggered passively
+            # ignore the max age option
+            if is_old and not is_mention:
+                return f"{entity.number} is too old"
+            return None
+
+        return validate
+
+    def reject_if_repeated(self, period: timedelta):
+        """rejects if multiple lookups are performed for the same number within period"""
+        processed = MaxAgeSet(period)
+
+        def validate(msg, entity):
+            if entity.number in processed:
+                return f"{entity.number} in cooldown period"
+            processed.add(entity.number)
+            return None
+
+        return validate
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -141,6 +178,12 @@ def parse_args():
         help="Path to file containing GH api key",
         required=True,
     )
+    parser.add_argument(
+        "--cooldown_min",
+        help="do not repeat lookups within the given number of minutes",
+        type=int,
+        default=5,
+    )
     return parser.parse_args()
 
 
@@ -158,6 +201,7 @@ def main():
         args.user,
         args.repo,
         args.max_age,
+        args.cooldown_min,
     )
     bot.start()
 

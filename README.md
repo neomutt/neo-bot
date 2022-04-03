@@ -35,6 +35,7 @@ optional arguments:
   -r REPO, --repo REPO  default github repository
   -m MAX_AGE, --max_age MAX_AGE
                         only show issues less than MAX_AGE days old
+  --cooldown_min        do not repeat lookups within the given number of minutes
 ```
 
 ### Example:
