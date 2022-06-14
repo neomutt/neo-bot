@@ -36,6 +36,10 @@ optional arguments:
   -m MAX_AGE, --max_age MAX_AGE
                         only show issues less than MAX_AGE days old
   --cooldown_min        do not repeat lookups within the given number of minutes
+  --nickserv_cloak NICKSERV_CLOAK
+                        Only try to identify if nickserv has this host (as we aren't using sasl)
+  --nickserv_password NICKSERV_PASSWORD
+                        Nickserv password to use with the given nickname as account
 ```
 
 ### Example:
