@@ -53,6 +53,13 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
     def on_privmsg(self, c, e):
         return self._process_message(c, e.source.nick, e)
 
+    def on_action(self, c, e):
+        if e.target == c.get_nickname():
+            respond_to = e.source.nick  # query, so respond there
+        else:
+            respond_to = e.target  # channel
+        return self._process_message(c, respond_to, e)
+
     def on_pubmsg(self, c, e):
         return self._process_message(c, self.channel, e)
 
