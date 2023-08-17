@@ -330,11 +330,8 @@ class GitHubAPI:
 
     def _emoji_from_emojiHTML(self, emojiHTML):
         # example category output of the graphql output:
-        #  '<div><g-emoji '
-        #  'class="g-emoji" '
-        #  'alias="wrench" '
-        #  'fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f527.png">🔧</g-emoji></div>'},
-        end = emojiHTML.rindex("</g-emoji>")  # the tag we actually wanna have
+        #  '<div>🔧</div>'},
+        end = emojiHTML.rindex("</div>")  # the tag we actually wanna have
         start = emojiHTML.rindex(">", 0, end) + 1  # we only want the inner text
         return emojiHTML[start:end]
 
