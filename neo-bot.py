@@ -17,7 +17,18 @@ from maxageset import MaxAgeSet
 
 class GitHubBot(irc.bot.SingleServerIRCBot):
     def __init__(
-        self, api, channel, nickname, server, port, user, repo, max_age, cooldown_min
+        self,
+        api,
+        channel,
+        nickname,
+        server,
+        port,
+        user,
+        repo,
+        max_age,
+        cooldown_min,
+        nickserv_cloak,
+        nickserv_password,
     ):
         super().__init__(((server, port),), nickname, nickname)
         self.api = api
@@ -37,6 +48,13 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         self.user = user
         self.repo = repo
         self.nickname = nickname
+
+        # nickserv stuff
+        self.account = nickname  # save our original, non extended nick for auth
+        self.nickserv_password = nickserv_password
+        self.nickserv_cloak = nickserv_cloak
+        self._is_doing_auth = False
+
         self.max_age = timedelta(days=max_age)
         self.policies = [
             self.reject_if_too_old(),
@@ -48,6 +66,7 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         self.nickname = c.get_nickname()
 
     def on_welcome(self, c, e):
+        self._start_auth(c)
         c.join(self.channel)
 
     def on_privmsg(self, c, e):
@@ -70,6 +89,54 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
             if resp is not None:
                 return resp
         return None
+
+    _auth_events = ("whoreply", "nosuchserver")
+
+    def _start_auth(self, c):
+        if self.nickserv_password is None:
+            return
+
+        self._is_doing_auth = True
+        # we want to know that we are talking to services, so we first ask whom we are talking to.
+        # Note this is inherently racy but the best we can do without sasl
+        for ev in self._auth_events:
+            c.add_global_handler(ev, self._do_auth)
+        c.who("nickserv")
+
+    def _validate_should_auth(self, e):
+        """Raises a ValueError if we shouldn't try to auth"""
+        if not self._is_doing_auth:
+            raise ValueError("ERROR: auth callback called but not initiated by us")
+
+        if e.type == "nosuchserver":
+            raise ValueError("ERROR: nickserv is unknown")
+
+        if e.type != "whoreply":
+            raise ValueError(f"ERROR: got invalid event {e}")
+
+    def _check_nickserv(self, e):
+        if len(e.arguments) < 3:
+            raise ValueError(f"ERROR: got invalid event {e}")
+        username = e.arguments[1]
+        host = e.arguments[2]
+        if username.lower() != "nickserv" or host != self.nickserv_cloak:
+            raise ValueError(
+                f"ERROR: username <{username}> not nickserv "
+                + f"or host {host} doesn't match {self.nickserv_cloak}"
+            )
+
+    def _do_auth(self, c, e):
+        """Fired when we should try to auth"""
+        try:
+            self._validate_should_auth(e)
+            self._check_nickserv(e)
+            c.privmsg("nickserv", f"IDENTIFY {self.account} {self.nickserv_password}")
+        except ValueError as err:
+            print(err)
+        finally:
+            for ev in self._auth_events:
+                c.remove_global_handler(ev, self._do_auth)
+            self._is_doing_auth = False
 
     def _process_message(self, c, answer_to, e):
         msgs = e.arguments
@@ -191,6 +258,17 @@ def parse_args():
         type=int,
         default=5,
     )
+    parser.add_argument(
+        "--nickserv_cloak",
+        help="Only try to identify if nickserv has this host (as we aren't using sasl)",
+        type=str,
+        default="services.libera.chat",
+    )
+    parser.add_argument(
+        "--nickserv_password",
+        help="Nickserv password to use with the given nickname as account",
+        type=str,
+    )
     return parser.parse_args()
 
 
@@ -209,6 +287,8 @@ def main():
         args.repo,
         args.max_age,
         args.cooldown_min,
+        args.nickserv_cloak,
+        args.nickserv_password,
     )
     bot.start()
 
