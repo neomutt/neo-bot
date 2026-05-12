@@ -1,12 +1,15 @@
-"""Tests for the neo-bot fixes (bugs 1-10)."""
+"""Tests for neo-bot bug fixes and security hardening."""
 
 import datetime
 import importlib
+import os
+import stat
 import sys
+import tempfile
 import time
 import types
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 def _install_irc_stub():
@@ -21,6 +24,8 @@ def _install_irc_stub():
     class _SingleServerIRCBot:
         def __init__(self, *args, **kwargs):
             self.reactor = MagicMock()
+            self._init_args = args
+            self._init_kwargs = kwargs
 
         def start(self):
             pass
@@ -29,12 +34,23 @@ def _install_irc_stub():
 
     irc_strings = types.ModuleType("irc.strings")
 
+    irc_connection = types.ModuleType("irc.connection")
+
+    class _Factory:
+        def __init__(self, wrapper=None, **kwargs):
+            self.wrapper = wrapper
+            self.kwargs = kwargs
+
+    irc_connection.Factory = _Factory
+
     irc_pkg.bot = irc_bot
     irc_pkg.strings = irc_strings
+    irc_pkg.connection = irc_connection
 
     sys.modules["irc"] = irc_pkg
     sys.modules["irc.bot"] = irc_bot
     sys.modules["irc.strings"] = irc_strings
+    sys.modules["irc.connection"] = irc_connection
 
 
 _install_irc_stub()
@@ -284,6 +300,12 @@ class TestBotBehavior(unittest.TestCase):
             bot.reject_if_repeated(datetime.timedelta(minutes=5)),
         ]
         bot.reactor = MagicMock()
+        # Permissive limiters so the bug-fix tests are unaffected.
+        bot._user_limiter = neo_bot.RateLimiter(1000, 60)
+        bot._channel_limiter = neo_bot.RateLimiter(1000, 60)
+        bot._send_limiter = neo_bot.RateLimiter(1000, 1)
+        bot._last_send_ts = 0.0
+        bot._send_min_interval = 0.0
         return bot
 
     def test_privmsg_replies_to_source_not_channel(self):
@@ -369,6 +391,322 @@ class TestBotBehavior(unittest.TestCase):
         bot.on_disconnect(c, e)
         elapsed = time.monotonic() - start
         self.assertLess(elapsed, 1.0, "on_disconnect must not block")
+
+
+# ---------------------------------------------------------------------------
+# Security #7: emoji HTML safe parser
+# ---------------------------------------------------------------------------
+class TestEmojiHTML(unittest.TestCase):
+    def test_basic_emoji(self):
+        self.assertEqual(neo_bot.emoji_from_html("<div>🔧</div>"), "🔧")
+
+    def test_html_entity(self):
+        self.assertEqual(neo_bot.emoji_from_html("<div>&amp;</div>"), "&")
+
+    def test_numeric_entity(self):
+        self.assertEqual(neo_bot.emoji_from_html("<div>&#128295;</div>"), "🔧")
+
+    def test_strips_nested_tags(self):
+        # Hostile / unexpected HTML must not crash and must not leak markup.
+        result = neo_bot.emoji_from_html("<div><span>x</span></div>")
+        self.assertEqual(result, "x")
+
+    def test_strips_control_chars(self):
+        result = neo_bot.emoji_from_html("<div>\x01\x02ok</div>")
+        self.assertNotIn("\x01", result)
+        self.assertIn("ok", result)
+
+    def test_empty(self):
+        self.assertEqual(neo_bot.emoji_from_html(""), "")
+        self.assertEqual(neo_bot.emoji_from_html(None), "")
+
+    def test_malformed_does_not_raise(self):
+        # Should never raise, even on garbage input.
+        try:
+            neo_bot.emoji_from_html("<div<<>>nope")
+        except Exception as exc:  # pragma: no cover
+            self.fail(f"emoji_from_html raised on garbage: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Security #8: IRC sanitization
+# ---------------------------------------------------------------------------
+class TestSanitizeIRC(unittest.TestCase):
+    def test_strips_ctcp(self):
+        self.assertNotIn("\x01", neo_bot.sanitize_irc("\x01ACTION evil\x01"))
+
+    def test_strips_color_codes(self):
+        self.assertNotIn("\x03", neo_bot.sanitize_irc("\x0304red text\x03"))
+
+    def test_strips_crlf(self):
+        out = neo_bot.sanitize_irc("hi\r\nPRIVMSG #other :pwn")
+        self.assertNotIn("\r", out)
+        self.assertNotIn("\n", out)
+        self.assertNotIn("PRIVMSG", out.split(" ")[0])  # no command injection
+
+    def test_strips_del(self):
+        self.assertNotIn("\x7f", neo_bot.sanitize_irc("a\x7fb"))
+
+    def test_truncates(self):
+        self.assertEqual(len(neo_bot.sanitize_irc("x" * 1000, max_len=100)), 100)
+
+    def test_none_safe(self):
+        self.assertEqual(neo_bot.sanitize_irc(None), "")
+
+    def test_render_sanitizes_title(self):
+        issue = neo_bot.Issue(
+            number=1, user="alice",
+            title="evil\x01\r\nPRIVMSG #x :pwn",
+            url="https://example.com/1",
+            date=datetime.datetime.now(datetime.timezone.utc),
+        )
+        rendered = issue.render()
+        for bad in ("\x01", "\r", "\n"):
+            self.assertNotIn(bad, rendered)
+
+
+# ---------------------------------------------------------------------------
+# Security #2: token file permission check
+# ---------------------------------------------------------------------------
+class TestTokenFilePermissions(unittest.TestCase):
+    def test_warns_on_world_readable(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as fh:
+            fh.write("secret")
+            path = fh.name
+        try:
+            os.chmod(path, 0o644)
+            with self.assertLogs(neo_bot.log, level="WARNING") as cm:
+                neo_bot.check_token_file_permissions(path)
+            self.assertTrue(
+                any("accessible to other users" in m for m in cm.output)
+            )
+        finally:
+            os.unlink(path)
+
+    def test_quiet_on_secure_perms(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as fh:
+            fh.write("secret")
+            path = fh.name
+        try:
+            os.chmod(path, 0o600)
+            # Capture WARNING+; must not emit a permission warning.
+            with self.assertLogs(neo_bot.log, level="WARNING") as cm:
+                # Need at least one log record for assertLogs not to fail,
+                # so log a sentinel.
+                neo_bot.log.warning("sentinel")
+                neo_bot.check_token_file_permissions(path)
+            warnings = [m for m in cm.output if "accessible to other" in m]
+            self.assertEqual(warnings, [])
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Security #10: systemd LoadCredential fallback
+# ---------------------------------------------------------------------------
+class TestResolveTokenPath(unittest.TestCase):
+    def test_explicit_wins(self):
+        self.assertEqual(neo_bot.resolve_token_path("/explicit"), "/explicit")
+
+    def test_credentials_directory_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            token = os.path.join(td, "github_token")
+            with open(token, "w") as fh:
+                fh.write("xyz")
+            with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": td}):
+                self.assertEqual(neo_bot.resolve_token_path(None), token)
+
+    def test_no_credentials_returns_none(self):
+        env = {k: v for k, v in os.environ.items() if k != "CREDENTIALS_DIRECTORY"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(neo_bot.resolve_token_path(None))
+
+
+# ---------------------------------------------------------------------------
+# Security #5/#6: rate limiters
+# ---------------------------------------------------------------------------
+class TestRateLimiter(unittest.TestCase):
+    def test_allows_up_to_limit(self):
+        rl = neo_bot.RateLimiter(3, 60)
+        self.assertTrue(rl.allow("k"))
+        self.assertTrue(rl.allow("k"))
+        self.assertTrue(rl.allow("k"))
+        self.assertFalse(rl.allow("k"))
+
+    def test_independent_keys(self):
+        rl = neo_bot.RateLimiter(1, 60)
+        self.assertTrue(rl.allow("a"))
+        self.assertFalse(rl.allow("a"))
+        self.assertTrue(rl.allow("b"))
+
+    def test_window_expires(self):
+        rl = neo_bot.RateLimiter(1, 0.05)
+        self.assertTrue(rl.allow("k"))
+        self.assertFalse(rl.allow("k"))
+        time.sleep(0.1)
+        self.assertTrue(rl.allow("k"))
+
+
+class TestBotRateLimiting(TestBotBehavior):
+    """Inherits _make_bot helper from TestBotBehavior."""
+
+    def test_per_user_lookup_limit_blocks(self):
+        bot = self._make_bot()
+        bot._user_limiter = neo_bot.RateLimiter(1, 60)
+        bot.api.find_by_id.return_value = neo_bot.Issue(
+            number=1, user="alice", title="hi",
+            url="https://example.com/1",
+            date=datetime.datetime.now(datetime.timezone.utc),
+        )
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        e1 = MagicMock(); e1.arguments = ["#1"]
+        e1.source.nick = "alice"; e1.target = "#neomutt"
+        e2 = MagicMock(); e2.arguments = ["#2"]
+        e2.source.nick = "alice"; e2.target = "#neomutt"
+        bot.on_pubmsg(c, e1)
+        bot.on_pubmsg(c, e2)
+        # First call sent, second blocked by per-user limiter.
+        self.assertEqual(c.privmsg.call_count, 1)
+
+    def test_send_throttle_uses_scheduler_when_due(self):
+        bot = self._make_bot()
+        bot._send_min_interval = 5.0
+        bot._last_send_ts = time.monotonic()  # next send must be deferred
+        bot.api.find_by_id.return_value = neo_bot.Issue(
+            number=1, user="alice", title="hi",
+            url="https://example.com/1",
+            date=datetime.datetime.now(datetime.timezone.utc),
+        )
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        e = MagicMock()
+        e.arguments = ["#1"]
+        e.source.nick = "alice"
+        e.target = "#neomutt"
+        bot.on_pubmsg(c, e)
+        # Scheduler used; immediate privmsg NOT called.
+        c.privmsg.assert_not_called()
+        bot.reactor.scheduler.execute_after.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Security #1: TLS / SASL connection wiring
+# ---------------------------------------------------------------------------
+class TestTLSAndSASL(unittest.TestCase):
+    def test_tls_factory_built(self):
+        api = MagicMock()
+        bot = neo_bot.GitHubBot(
+            api, "#c", "n", "irc.example.org", 6697,
+            "u", "r", 365, 5, use_tls=True,
+        )
+        kwargs = bot._init_kwargs
+        self.assertIn("connect_factory", kwargs)
+        self.assertIsNotNone(kwargs["connect_factory"].wrapper)
+        self.assertNotIn("sasl_login", kwargs)
+
+    def test_no_tls_skips_wrapper(self):
+        api = MagicMock()
+        bot = neo_bot.GitHubBot(
+            api, "#c", "n", "irc.example.org", 6667,
+            "u", "r", 365, 5, use_tls=False,
+        )
+        kwargs = bot._init_kwargs
+        self.assertIsNone(kwargs["connect_factory"].wrapper)
+
+    def test_sasl_credentials_passed(self):
+        api = MagicMock()
+        bot = neo_bot.GitHubBot(
+            api, "#c", "n", "irc.example.org", 6697,
+            "u", "r", 365, 5, use_tls=True,
+            sasl_login="botuser", sasl_password="pw-test-value",
+        )
+        kwargs = bot._init_kwargs
+        self.assertEqual(kwargs["sasl_login"], "botuser")
+        self.assertEqual(kwargs["password"], "pw-test-value")
+
+
+# ---------------------------------------------------------------------------
+# Security #9: logging used (not bare print) for events
+# ---------------------------------------------------------------------------
+class TestLogging(unittest.TestCase):
+    def test_kick_logs_warning(self):
+        bot = neo_bot.GitHubBot.__new__(neo_bot.GitHubBot)
+        bot.channel = "#x"
+        bot.reactor = MagicMock()
+        c = MagicMock()
+        e = MagicMock()
+        with self.assertLogs(neo_bot.log, level="WARNING") as cm:
+            bot.on_kick(c, e)
+        self.assertTrue(any("Kicked" in m for m in cm.output))
+
+    def test_disconnect_logs_warning(self):
+        bot = neo_bot.GitHubBot.__new__(neo_bot.GitHubBot)
+        c = MagicMock(); e = MagicMock()
+        with self.assertLogs(neo_bot.log, level="WARNING") as cm:
+            bot.on_disconnect(c, e)
+        self.assertTrue(any("Disconnected" in m for m in cm.output))
+
+
+# ---------------------------------------------------------------------------
+# CLI: TLS default, port defaulting, --no-tls flag
+# ---------------------------------------------------------------------------
+class TestCLI(unittest.TestCase):
+    def test_tls_defaults_on(self):
+        args = neo_bot.parse_args(["s", "c", "n", "-k", "/tmp/tok"])
+        self.assertTrue(args.tls)
+
+    def test_no_tls_flag(self):
+        args = neo_bot.parse_args(["s", "c", "n", "-k", "/tmp/tok", "--no-tls"])
+        self.assertFalse(args.tls)
+
+    def test_legacy_arg_names_still_work(self):
+        # Pre-existing --max_age and --cooldown_min must keep working.
+        args = neo_bot.parse_args([
+            "s", "c", "n", "-k", "/tmp/tok",
+            "--max_age", "30", "--cooldown_min", "7",
+        ])
+        self.assertEqual(args.max_age, 30)
+        self.assertEqual(args.cooldown_min, 7)
+
+
+# ---------------------------------------------------------------------------
+# Systemd unit hardening (#3, #4, #10)
+# ---------------------------------------------------------------------------
+class TestSystemdUnit(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(__file__), "neo-bot.service")) as fh:
+            self.unit = fh.read()
+
+    def test_no_git_pull_in_execstartpre(self):
+        # Look for an ExecStartPre directive that runs `git pull`.
+        for line in self.unit.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            self.assertNotIn(
+                "git pull", stripped,
+                f"unit must not auto-update via git pull: {line}",
+            )
+
+    def test_start_limit_set(self):
+        self.assertIn("StartLimitBurst", self.unit)
+        self.assertIn("StartLimitIntervalSec", self.unit)
+
+    def test_load_credential(self):
+        self.assertIn("LoadCredential=", self.unit)
+
+    def test_hardening_directives(self):
+        for directive in (
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
+            "PrivateTmp=true",
+            "RestrictAddressFamilies=",
+            "CapabilityBoundingSet=",
+            "SystemCallFilter=",
+            "MemoryDenyWriteExecute=true",
+        ):
+            self.assertIn(directive, self.unit, f"missing: {directive}")
 
 
 if __name__ == "__main__":

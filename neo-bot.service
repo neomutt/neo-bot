@@ -1,16 +1,63 @@
 [Unit]
 Description=NeoMutt IRC Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 Environment="PYTHONUNBUFFERED=TRUE"
 WorkingDirectory=/home/neo-bot/neo-bot
-ExecStartPre=/usr/bin/git pull
-ExecStart=/home/neo-bot/neo-bot/neo-bot.py -k /home/neo-bot/GITHUB_TOKEN irc.libera.chat neomutt neo-bot
+
+# NOTE: We deliberately do NOT auto-update via VCS on every restart.
+# A tampered or force-pushed remote would otherwise execute new code as
+# the bot user on every restart.  Update the bot manually:
+#     cd /home/neo-bot/neo-bot
+#     git fetch --tags
+#     git checkout <tag>
+#     systemctl restart neo-bot
+
+# Inject the GitHub token via systemd credentials.  The file is mounted
+# read-only at $CREDENTIALS_DIRECTORY/github_token (mode 0400, owned by
+# the service user) and is not visible to other processes.
+LoadCredential=github_token:/home/neo-bot/GITHUB_TOKEN
+
+ExecStart=/home/neo-bot/neo-bot/neo-bot.py \
+    --tls \
+    irc.libera.chat neomutt neo-bot
+
+User=neo-bot
+Group=neo-bot
 
 RestartSec=10
-Restart=always
+Restart=on-failure
+
+# --- Hardening -----------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0077
+ReadWritePaths=
 
 [Install]
 WantedBy=default.target
-

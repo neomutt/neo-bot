@@ -2,11 +2,22 @@
 # Joel Rosdahl <joel@rosdahl.net>
 
 import argparse
+import functools
+import html
+import html.parser
+import logging
+import os
 import re
-from datetime import datetime, timedelta, timezone
+import ssl
+import stat
+import sys
+import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import irc.bot
+import irc.connection
 import irc.strings
 import requests
 
@@ -14,11 +25,16 @@ import queries
 from maxageset import MaxAgeSet
 
 
+log = logging.getLogger("neo-bot")
+
+
+# ---------------------------------------------------------------------------
+# Regexes
+# ---------------------------------------------------------------------------
+
 # Matches:
 #   #123                       (uses defaults for user/repo)
 #   user/repo#123              (explicit user and repo)
-# Does NOT match a bare "repo#123" without a user, which previously caused
-# false positives like "v2.0#3".
 ISSUE_RE = re.compile(
     r"""
     (?:^|\s)                       # boundary must be space or start of line
@@ -33,19 +49,166 @@ ISSUE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Used to detect explicit nickname mentions like "neo-bot:" or "neo-bot,".
+
 def _mention_re(nickname):
+    """Detect explicit nickname mentions like 'neo-bot:' or 'neo-bot,'."""
     return re.compile(
         r"(?:^|\s)" + re.escape(nickname) + r"[:,]?(?:\s|$)",
         re.IGNORECASE,
     )
 
 
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+# Strip IRC control codes (CTCP \x01, colour \x03, formatting \x02 \x0F \x1D
+# \x1F \x16, plus all C0 controls and DEL).  Without this, an attacker who
+# controls an issue title can inject CTCPs, change colours, or smuggle
+# CR/LF and break the IRC protocol.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def sanitize_irc(text, max_len=300):
+    """Make text safe to send over IRC."""
+    if text is None:
+        return ""
+    cleaned = _CONTROL_CHARS_RE.sub(" ", str(text))
+    return cleaned[:max_len]
+
+
+def check_token_file_permissions(path):
+    """Warn loudly if the token file is group- or world-accessible."""
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        log.warning("Cannot stat token file %s: %s", path, exc)
+        return
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        log.warning(
+            "Token file %s is accessible to other users (mode %o); "
+            "run `chmod 600 %s` to fix.",
+            path, mode, path,
+        )
+
+
+def resolve_token_path(cli_path):
+    """Resolve the GitHub token path.
+
+    If `--api-token-path` is given, use it.  Otherwise, when the process is
+    started via systemd's `LoadCredential=`, fall back to
+    `$CREDENTIALS_DIRECTORY/github_token`.
+    """
+    if cli_path:
+        return cli_path
+    creds_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if creds_dir:
+        candidate = os.path.join(creds_dir, "github_token")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Emoji HTML parser (security fix #7: don't slice attacker-controlled HTML)
+# ---------------------------------------------------------------------------
+
+
+class _EmojiHTMLParser(html.parser.HTMLParser):
+    """Extract textual content from GitHub's emojiHTML field."""
+
+    def __init__(self):
+        super().__init__()
+        self._chunks = []
+
+    def handle_data(self, data):
+        self._chunks.append(data)
+
+    def handle_entityref(self, name):
+        self._chunks.append(html.unescape("&" + name + ";"))
+
+    def handle_charref(self, name):
+        self._chunks.append(html.unescape("&#" + name + ";"))
+
+    def text(self):
+        return "".join(self._chunks).strip()
+
+
+def emoji_from_html(emoji_html):
+    """Return the visible emoji from GitHub's emojiHTML field."""
+    if not emoji_html:
+        return ""
+    parser = _EmojiHTMLParser()
+    try:
+        parser.feed(emoji_html)
+        parser.close()
+    except Exception:  # malformed HTML — treat as no emoji
+        log.debug("Failed to parse emojiHTML: %r", emoji_html)
+        return ""
+    return sanitize_irc(parser.text(), max_len=16)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (security fixes #5 and #6)
+# ---------------------------------------------------------------------------
+
+
+class RateLimiter:
+    """Simple sliding-window rate limiter (per-key)."""
+
+    def __init__(self, max_events, period_sec):
+        self.max_events = max_events
+        self.period_sec = period_sec
+        self._events = defaultdict(deque)
+
+    def allow(self, key):
+        now = time.monotonic()
+        cutoff = now - self.period_sec
+        events = self._events[key]
+        while events and events[0] < cutoff:
+            events.popleft()
+        if len(events) >= self.max_events:
+            return False
+        events.append(now)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
+
+
 class GitHubBot(irc.bot.SingleServerIRCBot):
     def __init__(
-        self, api, channel, nickname, server, port, user, repo, max_age, cooldown_min
+        self,
+        api,
+        channel,
+        nickname,
+        server,
+        port,
+        user,
+        repo,
+        max_age,
+        cooldown_min,
+        use_tls=True,
+        sasl_login=None,
+        sasl_password=None,
+        per_user_lookups_per_min=10,
+        per_channel_lookups_per_min=30,
+        send_messages_per_sec=1,
     ):
-        super().__init__(((server, port),), nickname, nickname)
+        connect_factory = self._make_connect_factory(use_tls, server)
+        connect_kwargs = {"connect_factory": connect_factory}
+        if sasl_login and sasl_password:
+            connect_kwargs["sasl_login"] = sasl_login
+            connect_kwargs["password"] = sasl_password
+            log.info("SASL authentication enabled for %s", sasl_login)
+        elif sasl_password and not sasl_login:
+            connect_kwargs["password"] = sasl_password  # legacy server PASS
+        super().__init__(
+            ((server, port),), nickname, nickname, **connect_kwargs
+        )
         self.api = api
         self.channel = channel
         self.issue_re = ISSUE_RE
@@ -56,11 +219,31 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
             self.reject_if_too_old(),
             self.reject_if_repeated(timedelta(minutes=cooldown_min)),
         ]
+        # Rate limiters (security fixes #5, #6)
+        self._user_limiter = RateLimiter(per_user_lookups_per_min, 60)
+        self._channel_limiter = RateLimiter(per_channel_lookups_per_min, 60)
+        self._send_limiter = RateLimiter(send_messages_per_sec, 1)
+        self._last_send_ts = 0.0
+        self._send_min_interval = 1.0 / max(send_messages_per_sec, 1)
+
+    @staticmethod
+    def _make_connect_factory(use_tls, server):
+        if not use_tls:
+            log.warning(
+                "TLS is DISABLED — credentials and traffic will be in clear text."
+            )
+            return irc.connection.Factory()
+        ctx = ssl.create_default_context()
+        wrapper = functools.partial(ctx.wrap_socket, server_hostname=server)
+        return irc.connection.Factory(wrapper=wrapper)
+
+    # ---- IRC events --------------------------------------------------------
 
     def on_nicknameinuse(self, c, e):
         c.nick(c.get_nickname() + "_")
 
     def on_welcome(self, c, e):
+        log.info("Joining %s", self.channel)
         c.join(self.channel)
 
     def on_privmsg(self, c, e):
@@ -69,17 +252,28 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
 
     def on_action(self, c, e):
         if e.target == c.get_nickname():
-            respond_to = e.source.nick  # query, so respond there
+            respond_to = e.source.nick
         else:
-            respond_to = e.target  # channel
+            respond_to = e.target
         return self._process_message(c, respond_to, e)
 
     def on_pubmsg(self, c, e):
-        # Reply in the channel the message originated from.
         return self._process_message(c, e.target, e)
 
+    def on_kick(self, c, e):
+        log.warning("Kicked: %s", e)
+        try:
+            self.reactor.scheduler.execute_after(10, lambda: c.join(self.channel))
+        except AttributeError:
+            c.join(self.channel)
+
+    def on_disconnect(self, c, e):
+        # SingleServerIRCBot has built-in reconnection logic.
+        log.warning("Disconnected: %s", e)
+
+    # ---- Core processing ---------------------------------------------------
+
     def _apply_report_policies(self, msg, entity, nickname):
-        """Returns None if the bot should reply and an error message otherwise"""
         for f in self.policies:
             resp = f(msg, entity, nickname)
             if resp is not None:
@@ -88,40 +282,59 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
 
     def _process_message(self, c, answer_to, e):
         nickname = c.get_nickname()
-        msgs = e.arguments
-        for msg in msgs:
+        source_nick = getattr(e.source, "nick", None) or "?"
+        channel_key = e.target if e.target.startswith(("#", "&")) else "<priv>"
+
+        for msg in e.arguments:
             for user, repo, num in self.issue_re.findall(msg):
+                # Per-user / per-channel GitHub lookup throttling (#5).
+                if not self._user_limiter.allow(source_nick):
+                    log.info("Rate-limit (user=%s) blocked lookup #%s",
+                             source_nick, num)
+                    continue
+                if not self._channel_limiter.allow(channel_key):
+                    log.info("Rate-limit (channel=%s) blocked lookup #%s",
+                             channel_key, num)
+                    continue
+
                 try:
                     entity = self.find_entity_from_id(num, user, repo)
                 except Exception as err:
-                    print(f"FAILURE: {err}")
+                    log.exception("API failure for #%s: %s", num, err)
                     continue
                 if entity is None:
-                    print(f"Entity {num} not found")
+                    log.info("Entity %s not found", num)
                     continue
 
-                reject_reason = self._apply_report_policies(msg, entity, nickname)
-                if reject_reason is not None:
-                    print(reject_reason)
+                reject = self._apply_report_policies(msg, entity, nickname)
+                if reject is not None:
+                    log.info(reject)
                     continue
 
-                reply = entity.render()
-                c.privmsg(answer_to, reply)
-                print("SENT: " + reply)
+                self._send_throttled(c, answer_to, entity.render())
 
-    def on_kick(self, c, e):
-        print(f"Kicked: {e}")
-        # Use the reactor's scheduler so we don't block the event loop.
-        try:
-            self.reactor.scheduler.execute_after(10, lambda: c.join(self.channel))
-        except AttributeError:
-            # Older irc versions: fall back to direct join attempt.
-            c.join(self.channel)
+    def _send_throttled(self, c, target, text):
+        """Throttle outgoing messages to avoid IRC server flood-kill (#6)."""
+        text = sanitize_irc(text, max_len=400)
+        now = time.monotonic()
+        wait = self._last_send_ts + self._send_min_interval - now
+        if wait > 0:
+            try:
+                self.reactor.scheduler.execute_after(
+                    wait, lambda: self._do_send(c, target, text)
+                )
+                self._last_send_ts = now + wait
+                return
+            except AttributeError:
+                time.sleep(min(wait, 0.5))
+        self._do_send(c, target, text)
+        self._last_send_ts = time.monotonic()
 
-    def on_disconnect(self, c, e):
-        # SingleServerIRCBot has built-in reconnection logic; do not
-        # block the reactor with a manual sleep+reconnect loop.
-        print(f"Disconnected: {e}")
+    def _do_send(self, c, target, text):
+        c.privmsg(target, text)
+        log.info("SENT [%s]: %s", target, text)
+
+    # ---- Helpers -----------------------------------------------------------
 
     def find_entity_from_id(self, num, user=None, repo=None):
         if not user:
@@ -134,16 +347,12 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         def validate(msg, entity, nickname):
             is_mention = bool(_mention_re(nickname).search(msg))
             is_old = (entity.date + self.max_age) <= datetime.now(timezone.utc)
-            # if the bot is explicitly mentioned rather than just triggered
-            # passively, ignore the max age option
             if is_old and not is_mention:
                 return f"{entity.number} is too old"
             return None
-
         return validate
 
     def reject_if_repeated(self, period: timedelta):
-        """rejects if multiple lookups are performed for the same number within period"""
         processed = MaxAgeSet(period)
 
         def validate(msg, entity, nickname):
@@ -151,64 +360,12 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
                 return f"{entity.number} in cooldown period"
             processed.add(entity.number)
             return None
-
         return validate
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("server", help="IRC server to connect to")
-    parser.add_argument("channel", help="IRC channel to join")
-    parser.add_argument("nickname", help="nickname to use")
-
-    parser.add_argument(
-        "-p", "--port", help="port of the IRC server", type=int, default=6667
-    )
-    parser.add_argument("-u", "--user", help="default github user", default="neomutt")
-    parser.add_argument(
-        "-r", "--repo", help="default github repository", default="neomutt"
-    )
-    parser.add_argument(
-        "-m",
-        "--max_age",
-        help="only show issues less than MAX_AGE days old",
-        type=int,
-        default=365,
-    )
-
-    parser.add_argument(
-        "-k",
-        "--api_token_path",
-        help="Path to file containing GH api key",
-        required=True,
-    )
-    parser.add_argument(
-        "--cooldown_min",
-        help="do not repeat lookups within the given number of minutes",
-        type=int,
-        default=5,
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    print(args)
-
-    api = GitHubAPI(args.api_token_path)
-    bot = GitHubBot(
-        api,
-        f"#{args.channel}",
-        args.nickname,
-        args.server,
-        args.port,
-        args.user,
-        args.repo,
-        args.max_age,
-        args.cooldown_min,
-    )
-    bot.start()
+# ---------------------------------------------------------------------------
+# Entities
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -221,7 +378,7 @@ class Issue:
     deleted: bool = False
 
     def render(self):
-        return f'Issue by @{self.user} "{self.title}": {self.url}'
+        return f'Issue by @{sanitize_irc(self.user, 64)} "{sanitize_irc(self.title)}": {self.url}'
 
 
 @dataclass
@@ -233,7 +390,7 @@ class PullRequest:
     date: datetime
 
     def render(self):
-        return f'PR by @{self.user} "{self.title}": {self.url}'
+        return f'PR by @{sanitize_irc(self.user, 64)} "{sanitize_irc(self.title)}": {self.url}'
 
 
 @dataclass
@@ -247,43 +404,40 @@ class Discussion:
     category: str
 
     def render(self):
-        if self.num_comments == 1:
-            comment_str = "comment"
-        else:
-            comment_str = "comments"
-
+        comment_str = "comment" if self.num_comments == 1 else "comments"
+        cat = sanitize_irc(self.category, 16)
         return (
-            f'{self.category} discussion by @{self.user} "{self.title}" '
+            f'{cat} discussion by @{sanitize_irc(self.user, 64)} '
+            f'"{sanitize_irc(self.title)}" '
             f"with {self.num_comments} {comment_str}: {self.url}"
         )
 
 
 def _author_login(node):
-    """Return the login of an entity's author, or 'ghost' if the account
-    has been deleted (GitHub returns null for deleted users)."""
+    """Return the login of an entity's author, or 'ghost' if deleted."""
     author = node.get("author") if isinstance(node, dict) else None
     if not author:
         return "ghost"
     return author.get("login") or "ghost"
 
 
+# ---------------------------------------------------------------------------
+# GitHub API
+# ---------------------------------------------------------------------------
+
+
 class GitHubAPI:
     _GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
 
     def __init__(self, api_token_path, timeout_sec=5):
-        """Grahpql API of GitHub
-        Params:
-            api_token_path: Path to file containing GH api key.
-                            Needs at least the public_repo scope
-            timeout_sec: Default request timeout in seconds
-        """
+        check_token_file_permissions(api_token_path)
         api_key = self._load_api_key(api_token_path)
         self._session = self._init_session(api_key)
         self.timeout_sec = timeout_sec
 
     def _load_api_key(self, api_token_path):
-        with open(api_token_path, "r") as file:
-            return file.readline().strip()
+        with open(api_token_path, "r") as fh:
+            return fh.readline().strip()
 
     def _init_session(self, api_key):
         session = requests.Session()
@@ -327,26 +481,156 @@ class GitHubAPI:
                 url=discussion["url"],
                 date=format_time(discussion["createdAt"]),
                 num_comments=discussion["comments"]["totalCount"],
-                category=self._emoji_from_emojiHTML(
-                    discussion["category"]["emojiHTML"]
-                ),
+                category=emoji_from_html(discussion["category"]["emojiHTML"]),
             )
-        else:
-            # not found or someone forgot to update this function after modifying the
-            # graphql query
-            return
+        return None
 
+    # Backwards-compat shim
     def _emoji_from_emojiHTML(self, emojiHTML):
-        # example category output of the graphql output:
-        #  '<div>🔧</div>'},
-        end = emojiHTML.rindex("</div>")  # the tag we actually wanna have
-        start = emojiHTML.rindex(">", 0, end) + 1  # we only want the inner text
-        return emojiHTML[start:end]
+        return emoji_from_html(emojiHTML)
 
 
-def format_time(time):
-    """Parse a GitHub ISO-8601 UTC timestamp into a timezone-aware datetime."""
-    return datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+def format_time(time_str):
+    """Parse a GitHub ISO-8601 UTC timestamp into a tz-aware datetime."""
+    return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _read_secret_file(path):
+    if not path:
+        return None
+    with open(path, "r") as fh:
+        return fh.readline().strip()
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("server", help="IRC server to connect to")
+    parser.add_argument("channel", help="IRC channel to join (e.g. #neomutt)")
+    parser.add_argument("nickname", help="nickname to use")
+
+    parser.add_argument(
+        "-p", "--port", help="port of the IRC server (default: 6697 with TLS, 6667 without)",
+        type=int, default=None,
+    )
+    parser.add_argument("-u", "--user", help="default github user", default="neomutt")
+    parser.add_argument(
+        "-r", "--repo", help="default github repository", default="neomutt"
+    )
+    parser.add_argument(
+        "-m", "--max-age", "--max_age", dest="max_age",
+        help="only show issues less than MAX_AGE days old",
+        type=int, default=365,
+    )
+
+    parser.add_argument(
+        "-k", "--api-token-path", "--api_token_path", dest="api_token_path",
+        help="Path to file containing GH api key. "
+             "Falls back to $CREDENTIALS_DIRECTORY/github_token (systemd).",
+        required=False,
+    )
+    parser.add_argument(
+        "--cooldown-min", "--cooldown_min", dest="cooldown_min",
+        help="do not repeat lookups within the given number of minutes",
+        type=int, default=5,
+    )
+
+    # Security: TLS + SASL
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument(
+        "--tls", dest="tls", action="store_true", default=True,
+        help="use TLS to connect to the IRC server (default)",
+    )
+    tls_group.add_argument(
+        "--no-tls", dest="tls", action="store_false",
+        help="disable TLS (NOT recommended)",
+    )
+    parser.add_argument(
+        "--sasl-user", dest="sasl_user", default=None,
+        help="SASL PLAIN username for IRC authentication",
+    )
+    parser.add_argument(
+        "--sasl-password-file", dest="sasl_password_file", default=None,
+        help="path to file containing the SASL password",
+    )
+
+    # Rate limits
+    parser.add_argument(
+        "--per-user-lookups-per-min", type=int, default=10,
+        help="max GitHub lookups per IRC user per minute",
+    )
+    parser.add_argument(
+        "--per-channel-lookups-per-min", type=int, default=30,
+        help="max GitHub lookups per channel per minute",
+    )
+    parser.add_argument(
+        "--send-messages-per-sec", type=int, default=1,
+        help="max messages per second sent to IRC (flood protection)",
+    )
+
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="enable debug logging"
+    )
+
+    return parser.parse_args(argv)
+
+
+def setup_logging(verbose=False):
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+
+def main():
+    args = parse_args()
+    setup_logging(args.verbose)
+    log.debug("args: %s", args)
+
+    token_path = resolve_token_path(args.api_token_path)
+    if not token_path:
+        log.error(
+            "No GitHub token: pass --api-token-path or run via systemd "
+            "with LoadCredential=github_token:..."
+        )
+        sys.exit(2)
+
+    sasl_password = _read_secret_file(args.sasl_password_file)
+
+    if args.port is None:
+        port = 6697 if args.tls else 6667
+    else:
+        port = args.port
+
+    channel = args.channel if args.channel.startswith(("#", "&")) else f"#{args.channel}"
+
+    api = GitHubAPI(token_path)
+    bot = GitHubBot(
+        api,
+        channel,
+        args.nickname,
+        args.server,
+        port,
+        args.user,
+        args.repo,
+        args.max_age,
+        args.cooldown_min,
+        use_tls=args.tls,
+        sasl_login=args.sasl_user,
+        sasl_password=sasl_password,
+        per_user_lookups_per_min=args.per_user_lookups_per_min,
+        per_channel_lookups_per_min=args.per_channel_lookups_per_min,
+        send_messages_per_sec=args.send_messages_per_sec,
+    )
+    bot.start()
 
 
 if __name__ == "__main__":
