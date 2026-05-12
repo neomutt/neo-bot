@@ -3,8 +3,7 @@
 
 import argparse
 import re
-import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 
 import irc.bot
@@ -15,6 +14,33 @@ import queries
 from maxageset import MaxAgeSet
 
 
+# Matches:
+#   #123                       (uses defaults for user/repo)
+#   user/repo#123              (explicit user and repo)
+# Does NOT match a bare "repo#123" without a user, which previously caused
+# false positives like "v2.0#3".
+ISSUE_RE = re.compile(
+    r"""
+    (?:^|\s)                       # boundary must be space or start of line
+    (?:
+        (?P<user>[\w\.\-]+)        # user
+        /
+        (?P<repo>[\w\.\-]+)        # repo
+    )?                             # optional; if absent, defaults are used
+    \#(?P<num>[0-9]+)              # issue number
+    \b                             # word boundary
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Used to detect explicit nickname mentions like "neo-bot:" or "neo-bot,".
+def _mention_re(nickname):
+    return re.compile(
+        r"(?:^|\s)" + re.escape(nickname) + r"[:,]?(?:\s|$)",
+        re.IGNORECASE,
+    )
+
+
 class GitHubBot(irc.bot.SingleServerIRCBot):
     def __init__(
         self, api, channel, nickname, server, port, user, repo, max_age, cooldown_min
@@ -22,21 +48,9 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         super().__init__(((server, port),), nickname, nickname)
         self.api = api
         self.channel = channel
-        self.issue_re = re.compile(
-            r"""
-            (?:^|\s) # boundary must be space or start of line
-            (?:
-                (?:(?P<user>[\w\.\-]+)/)? # Optional user, if present must end in slash
-                (?P<repo>[\w\.\-]+) # repo
-            )? # optional, sane defaults are chosen if not provided
-            \#(?P<num>[0-9]+) # issue number
-            \b # followed by some word boundary (punctuation, space...)
-        """,
-            re.IGNORECASE | re.VERBOSE,
-        )
+        self.issue_re = ISSUE_RE
         self.user = user
         self.repo = repo
-        self.nickname = nickname
         self.max_age = timedelta(days=max_age)
         self.policies = [
             self.reject_if_too_old(),
@@ -45,13 +59,13 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
 
     def on_nicknameinuse(self, c, e):
         c.nick(c.get_nickname() + "_")
-        self.nickname = c.get_nickname()
 
     def on_welcome(self, c, e):
         c.join(self.channel)
 
     def on_privmsg(self, c, e):
-        return self._process_message(c, self.channel, e)
+        # Reply to the source nick, never leak private queries to the channel.
+        return self._process_message(c, e.source.nick, e)
 
     def on_action(self, c, e):
         if e.target == c.get_nickname():
@@ -61,17 +75,19 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         return self._process_message(c, respond_to, e)
 
     def on_pubmsg(self, c, e):
-        return self._process_message(c, self.channel, e)
+        # Reply in the channel the message originated from.
+        return self._process_message(c, e.target, e)
 
-    def _apply_report_policies(self, msg, entity):
+    def _apply_report_policies(self, msg, entity, nickname):
         """Returns None if the bot should reply and an error message otherwise"""
         for f in self.policies:
-            resp = f(msg, entity)
+            resp = f(msg, entity, nickname)
             if resp is not None:
                 return resp
         return None
 
     def _process_message(self, c, answer_to, e):
+        nickname = c.get_nickname()
         msgs = e.arguments
         for msg in msgs:
             for user, repo, num in self.issue_re.findall(msg):
@@ -84,7 +100,7 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
                     print(f"Entity {num} not found")
                     continue
 
-                reject_reason = self._apply_report_policies(msg, entity)
+                reject_reason = self._apply_report_policies(msg, entity, nickname)
                 if reject_reason is not None:
                     print(reject_reason)
                     continue
@@ -94,36 +110,18 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
                 print("SENT: " + reply)
 
     def on_kick(self, c, e):
-        print("Parted by ")
-        print(e)
-        delay = 10
-        time.sleep(delay)
-        while True:
-            try:
-                print("... rejoining")
-                c.join(self.channel)
-                break
-            except:
-                delay = 2 * delay
-                if delay > 300:
-                    delay = 300
-                time.sleep(delay)
+        print(f"Kicked: {e}")
+        # Use the reactor's scheduler so we don't block the event loop.
+        try:
+            self.reactor.scheduler.execute_after(10, lambda: c.join(self.channel))
+        except AttributeError:
+            # Older irc versions: fall back to direct join attempt.
+            c.join(self.channel)
 
     def on_disconnect(self, c, e):
-        print("Disconnected by ")
-        print(e)
-        delay = 10
-        time.sleep(delay)
-        while True:
-            try:
-                print("... reconnecting")
-                c.reconnect()
-                break
-            except:
-                delay = 2 * delay
-                if delay > 300:
-                    delay = 300
-                time.sleep(delay)
+        # SingleServerIRCBot has built-in reconnection logic; do not
+        # block the reactor with a manual sleep+reconnect loop.
+        print(f"Disconnected: {e}")
 
     def find_entity_from_id(self, num, user=None, repo=None):
         if not user:
@@ -133,11 +131,11 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         return self.api.find_by_id(num, user, repo)
 
     def reject_if_too_old(self):
-        def validate(msg, entity):
-            is_mention = msg.startswith(self.nickname)
-            is_old = (entity.date + self.max_age) <= datetime.now()
-            # if the bot is explicitly mentioned rather than just triggered passively
-            # ignore the max age option
+        def validate(msg, entity, nickname):
+            is_mention = bool(_mention_re(nickname).search(msg))
+            is_old = (entity.date + self.max_age) <= datetime.now(timezone.utc)
+            # if the bot is explicitly mentioned rather than just triggered
+            # passively, ignore the max age option
             if is_old and not is_mention:
                 return f"{entity.number} is too old"
             return None
@@ -148,7 +146,7 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         """rejects if multiple lookups are performed for the same number within period"""
         processed = MaxAgeSet(period)
 
-        def validate(msg, entity):
+        def validate(msg, entity, nickname):
             if entity.number in processed:
                 return f"{entity.number} in cooldown period"
             processed.add(entity.number)
@@ -260,6 +258,15 @@ class Discussion:
         )
 
 
+def _author_login(node):
+    """Return the login of an entity's author, or 'ghost' if the account
+    has been deleted (GitHub returns null for deleted users)."""
+    author = node.get("author") if isinstance(node, dict) else None
+    if not author:
+        return "ghost"
+    return author.get("login") or "ghost"
+
+
 class GitHubAPI:
     _GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
 
@@ -279,11 +286,12 @@ class GitHubAPI:
             return file.readline().strip()
 
     def _init_session(self, api_key):
-        self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+        session = requests.Session()
+        session.headers.update({"Authorization": f"Bearer {api_key}"})
+        return session
 
     def query(self, query, variables=None):
-        resp = self.session.post(
+        resp = self._session.post(
             self._GRAPHQL_ENDPOINT,
             json={"query": query, "variables": variables},
             timeout=self.timeout_sec,
@@ -292,13 +300,13 @@ class GitHubAPI:
         return resp.json()
 
     def find_by_id(self, id_, user="neomutt", repo="neomutt"):
-        vars = {"num": int(id_), "user": user, "repo": repo}
-        res = self.query(queries.FETCH_ALL_BY_ID, vars)
+        variables = {"num": int(id_), "user": user, "repo": repo}
+        res = self.query(queries.FETCH_ALL_BY_ID, variables)
         data = res["data"]["repository"]
         if issue := data["issue"]:
             return Issue(
                 number=issue["number"],
-                user=issue["author"]["login"],
+                user=_author_login(issue),
                 title=issue["title"],
                 url=issue["url"],
                 date=format_time(issue["createdAt"]),
@@ -306,7 +314,7 @@ class GitHubAPI:
         elif pr := data["pullRequest"]:
             return PullRequest(
                 number=pr["number"],
-                user=pr["author"]["login"],
+                user=_author_login(pr),
                 title=pr["title"],
                 url=pr["url"],
                 date=format_time(pr["createdAt"]),
@@ -314,7 +322,7 @@ class GitHubAPI:
         elif discussion := data["discussion"]:
             return Discussion(
                 number=discussion["number"],
-                user=discussion["author"]["login"],
+                user=_author_login(discussion),
                 title=discussion["title"],
                 url=discussion["url"],
                 date=format_time(discussion["createdAt"]),
@@ -337,7 +345,8 @@ class GitHubAPI:
 
 
 def format_time(time):
-    return datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ")
+    """Parse a GitHub ISO-8601 UTC timestamp into a timezone-aware datetime."""
+    return datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
 if __name__ == "__main__":

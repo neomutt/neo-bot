@@ -22,8 +22,8 @@ class MaxAgeSet(collections.abc.MutableSet):
         self._items.append((datetime.datetime.now(), item))
 
     def discard(self, value):
-        for i, item in self._items:
-            if item[1] == value:
+        for i, (_, item) in enumerate(self._items):
+            if item == value:
                 self._items.pop(i)
                 return
 
@@ -37,8 +37,8 @@ class MaxAgeSet(collections.abc.MutableSet):
 
     def __iter__(self):
         self.cleanup()
-        for i in self._items():
-            yield i[1]
+        for _, item in self._items:
+            yield item
 
     def cleanup(self):
         oldest = datetime.datetime.now() - self._max_age
