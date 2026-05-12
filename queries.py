@@ -27,7 +27,7 @@ query ($num: Int!, $user: String = "neomutt", $repo: String = "neomutt") {
       author {
         login
       }
-      comments(first: 0) {
+      comments {
         totalCount
       }
       category {

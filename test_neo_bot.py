@@ -306,6 +306,8 @@ class TestBotBehavior(unittest.TestCase):
         bot._send_limiter = neo_bot.RateLimiter(1000, 1)
         bot._last_send_ts = 0.0
         bot._send_min_interval = 0.0
+        # Multi-channel default registry (robustness fix #13).
+        bot._channels = {"#neomutt": ("neomutt", "neomutt")}
         return bot
 
     def test_privmsg_replies_to_source_not_channel(self):
@@ -375,7 +377,10 @@ class TestBotBehavior(unittest.TestCase):
         """Bug #10: on_kick must not block; it should schedule a rejoin."""
         bot = self._make_bot()
         c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
         e = MagicMock()
+        e.target = "#neomutt"
+        e.arguments = ["neo-bot", "bye"]
         start = time.monotonic()
         bot.on_kick(c, e)
         elapsed = time.monotonic() - start
@@ -707,6 +712,220 @@ class TestSystemdUnit(unittest.TestCase):
             "MemoryDenyWriteExecute=true",
         ):
             self.assertIn(directive, self.unit, f"missing: {directive}")
+
+
+# ---------------------------------------------------------------------------
+# Robustness #1: GraphQL `errors` array surfaces as an exception
+# ---------------------------------------------------------------------------
+class TestGraphQLErrors(unittest.TestCase):
+    def _make_api(self):
+        api = neo_bot.GitHubAPI.__new__(neo_bot.GitHubAPI)
+        api._session = MagicMock()
+        api.timeout_sec = 5
+        return api
+
+    def test_errors_array_raises(self):
+        api = self._make_api()
+        resp = MagicMock()
+        resp.json.return_value = {
+            "errors": [{"message": "bad query"}, {"message": "rate limited"}],
+        }
+        resp.raise_for_status = MagicMock()
+        api._session.post.return_value = resp
+        with self.assertRaises(neo_bot.GraphQLError) as cm:
+            api.query("query {}", {})
+        self.assertIn("bad query", str(cm.exception))
+        self.assertIn("rate limited", str(cm.exception))
+
+    def test_no_errors_returns_body(self):
+        api = self._make_api()
+        resp = MagicMock()
+        resp.json.return_value = {"data": {"x": 1}}
+        resp.raise_for_status = MagicMock()
+        api._session.post.return_value = resp
+        out = api.query("query {}", {})
+        self.assertEqual(out, {"data": {"x": 1}})
+
+
+# ---------------------------------------------------------------------------
+# Robustness #3: HTTPAdapter retry mounted on the session
+# ---------------------------------------------------------------------------
+class TestRetryAdapter(unittest.TestCase):
+    def test_retry_adapter_mounted(self):
+        api = neo_bot.GitHubAPI.__new__(neo_bot.GitHubAPI)
+        session = api._init_session("tok")
+        adapter = session.get_adapter("https://api.github.com/")
+        self.assertIsNotNone(adapter)
+        retry = adapter.max_retries
+        self.assertEqual(retry.total, 3)
+        self.assertIn(502, retry.status_forcelist)
+        self.assertIn(429, retry.status_forcelist)
+
+
+# ---------------------------------------------------------------------------
+# Robustness #7: Issue.deleted removed
+# ---------------------------------------------------------------------------
+class TestIssueDataclass(unittest.TestCase):
+    def test_no_deleted_field(self):
+        fields = {f.name for f in neo_bot.Issue.__dataclass_fields__.values()}
+        self.assertNotIn("deleted", fields)
+
+
+# ---------------------------------------------------------------------------
+# Robustness #11: GraphQL query no longer uses `comments(first: 0)`
+# ---------------------------------------------------------------------------
+class TestGraphQLQuery(unittest.TestCase):
+    def test_no_first_zero(self):
+        import queries as q
+        self.assertNotIn("first: 0", q.FETCH_ALL_BY_ID)
+        self.assertIn("totalCount", q.FETCH_ALL_BY_ID)
+
+
+# ---------------------------------------------------------------------------
+# Robustness #12: graceful shutdown via SIGTERM/SIGINT
+# ---------------------------------------------------------------------------
+class TestSignalHandlers(unittest.TestCase):
+    def test_signal_handler_calls_disconnect_and_exits(self):
+        import signal as _signal
+        bot = MagicMock()
+        # Capture the registered handlers; restore originals after.
+        old_term = _signal.getsignal(_signal.SIGTERM)
+        old_int = _signal.getsignal(_signal.SIGINT)
+        try:
+            neo_bot.install_signal_handlers(bot)
+            handler = _signal.getsignal(_signal.SIGTERM)
+            self.assertNotEqual(handler, old_term)
+            with self.assertRaises(SystemExit) as cm:
+                handler(_signal.SIGTERM, None)
+            self.assertEqual(cm.exception.code, 0)
+            bot.disconnect.assert_called_with("shutting down")
+        finally:
+            _signal.signal(_signal.SIGTERM, old_term)
+            _signal.signal(_signal.SIGINT, old_int)
+
+
+# ---------------------------------------------------------------------------
+# Robustness #13: multi-channel + per-channel default user/repo
+# ---------------------------------------------------------------------------
+class TestChannelSpec(unittest.TestCase):
+    def test_bare_name_uses_default(self):
+        self.assertEqual(
+            neo_bot.parse_channel_spec("foo", "u", "r"),
+            ("#foo", "u", "r"),
+        )
+
+    def test_name_with_owner_repo(self):
+        self.assertEqual(
+            neo_bot.parse_channel_spec("#bar:acme/widget", "u", "r"),
+            ("#bar", "acme", "widget"),
+        )
+
+    def test_invalid_spec_raises(self):
+        with self.assertRaises(ValueError):
+            neo_bot.parse_channel_spec("foo:nopeslash", "u", "r")
+
+    def test_amp_channel(self):
+        self.assertEqual(
+            neo_bot.parse_channel_spec("&local", "u", "r"),
+            ("&local", "u", "r"),
+        )
+
+
+class TestMultiChannel(TestBotBehavior):
+    def _make_multi_bot(self):
+        bot = self._make_bot()
+        # Reset _channels (TestBotBehavior._make_bot doesn't set it).
+        bot._channels = {
+            "#neomutt": ("neomutt", "neomutt"),
+            "#otherproj": ("acme", "widget"),
+        }
+        return bot
+
+    def test_join_all_channels_on_welcome(self):
+        bot = self._make_multi_bot()
+        c = MagicMock()
+        e = MagicMock()
+        bot.on_welcome(c, e)
+        joined = sorted(call.args[0] for call in c.join.call_args_list)
+        self.assertEqual(joined, ["#neomutt", "#otherproj"])
+
+    def test_per_channel_defaults_used(self):
+        bot = self._make_multi_bot()
+        bot.api.find_by_id.return_value = neo_bot.Issue(
+            number=42, user="alice", title="t",
+            url="https://example.com/42",
+            date=datetime.datetime.now(datetime.timezone.utc),
+        )
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        e = MagicMock()
+        e.arguments = ["#42"]
+        e.source.nick = "alice"
+        e.target = "#otherproj"
+        bot.on_pubmsg(c, e)
+        # Bot should have looked up using the otherproj defaults.
+        bot.api.find_by_id.assert_called_with("42", "acme", "widget")
+
+    def test_explicit_user_repo_overrides_per_channel(self):
+        bot = self._make_multi_bot()
+        bot.api.find_by_id.return_value = neo_bot.Issue(
+            number=1, user="alice", title="t",
+            url="https://example.com/1",
+            date=datetime.datetime.now(datetime.timezone.utc),
+        )
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        e = MagicMock()
+        e.arguments = ["see foo/bar#1"]
+        e.source.nick = "alice"
+        e.target = "#otherproj"
+        bot.on_pubmsg(c, e)
+        bot.api.find_by_id.assert_called_with("1", "foo", "bar")
+
+    def test_kick_only_rejoins_us(self):
+        bot = self._make_multi_bot()
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        # Someone else got kicked.
+        e = MagicMock()
+        e.target = "#neomutt"
+        e.arguments = ["alice", "bye"]
+        bot.on_kick(c, e)
+        bot.reactor.scheduler.execute_after.assert_not_called()
+
+    def test_kick_rejoins_kicked_channel(self):
+        bot = self._make_multi_bot()
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        e = MagicMock()
+        e.target = "#otherproj"
+        e.arguments = ["neo-bot", "bye"]
+        bot.on_kick(c, e)
+        bot.reactor.scheduler.execute_after.assert_called_once()
+        # Verify the lambda joins the same channel.
+        delay, fn = bot.reactor.scheduler.execute_after.call_args[0]
+        fn()
+        c.join.assert_called_with("#otherproj")
+
+    def test_kick_unknown_channel_ignored(self):
+        bot = self._make_multi_bot()
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        e = MagicMock()
+        e.target = "#stranger"
+        e.arguments = ["neo-bot", "bye"]
+        bot.on_kick(c, e)
+        bot.reactor.scheduler.execute_after.assert_not_called()
+
+
+class TestExtraChannelCLI(unittest.TestCase):
+    def test_extra_channel_repeatable(self):
+        args = neo_bot.parse_args([
+            "s", "neomutt", "n", "-k", "/tmp/tok",
+            "--channel", "extra1",
+            "--channel", "extra2:owner/repo",
+        ])
+        self.assertEqual(args.extra_channels, ["extra1", "extra2:owner/repo"])
 
 
 if __name__ == "__main__":

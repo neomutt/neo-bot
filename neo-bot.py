@@ -8,6 +8,7 @@ import html.parser
 import logging
 import os
 import re
+import signal
 import ssl
 import stat
 import sys
@@ -20,6 +21,8 @@ import irc.bot
 import irc.connection
 import irc.strings
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import queries
 from maxageset import MaxAgeSet
@@ -197,6 +200,7 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         per_user_lookups_per_min=10,
         per_channel_lookups_per_min=30,
         send_messages_per_sec=1,
+        channels=None,
     ):
         connect_factory = self._make_connect_factory(use_tls, server)
         connect_kwargs = {"connect_factory": connect_factory}
@@ -210,7 +214,17 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
             ((server, port),), nickname, nickname, **connect_kwargs
         )
         self.api = api
+        # Backward-compat: a single primary channel.  Multi-channel users
+        # populate `channels` (robustness fix #13).
         self.channel = channel
+        # Per-channel default (user, repo).  Channel keys are normalised to
+        # lower case to match RFC 1459 / 2812 channel-name case folding.
+        self._channels = {}
+        if channels:
+            for name, (u, r) in channels.items():
+                self._channels[name.lower()] = (u, r)
+        if channel and channel.lower() not in self._channels:
+            self._channels[channel.lower()] = (user, repo)
         self.issue_re = ISSUE_RE
         self.user = user
         self.repo = repo
@@ -225,6 +239,14 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         self._send_limiter = RateLimiter(send_messages_per_sec, 1)
         self._last_send_ts = 0.0
         self._send_min_interval = 1.0 / max(send_messages_per_sec, 1)
+
+    def _defaults_for(self, channel_name):
+        """Return (user, repo) defaults for the given channel."""
+        if channel_name:
+            entry = self._channels.get(channel_name.lower())
+            if entry:
+                return entry
+        return (self.user, self.repo)
 
     @staticmethod
     def _make_connect_factory(use_tls, server):
@@ -243,8 +265,9 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         c.nick(c.get_nickname() + "_")
 
     def on_welcome(self, c, e):
-        log.info("Joining %s", self.channel)
-        c.join(self.channel)
+        for chan in self._channels:
+            log.info("Joining %s", chan)
+            c.join(chan)
 
     def on_privmsg(self, c, e):
         # Reply to the source nick, never leak private queries to the channel.
@@ -261,11 +284,18 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         return self._process_message(c, e.target, e)
 
     def on_kick(self, c, e):
-        log.warning("Kicked: %s", e)
+        # Rejoin the channel we were kicked from (only if *we* were kicked).
+        kicked_nick = e.arguments[0] if e.arguments else None
+        chan = e.target or self.channel
+        log.warning("Kicked from %s (target=%s): %s", chan, kicked_nick, e)
+        if kicked_nick and kicked_nick != c.get_nickname():
+            return
+        if chan.lower() not in self._channels:
+            return
         try:
-            self.reactor.scheduler.execute_after(10, lambda: c.join(self.channel))
+            self.reactor.scheduler.execute_after(10, lambda: c.join(chan))
         except AttributeError:
-            c.join(self.channel)
+            c.join(chan)
 
     def on_disconnect(self, c, e):
         # SingleServerIRCBot has built-in reconnection logic.
@@ -283,7 +313,12 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
     def _process_message(self, c, answer_to, e):
         nickname = c.get_nickname()
         source_nick = getattr(e.source, "nick", None) or "?"
-        channel_key = e.target if e.target.startswith(("#", "&")) else "<priv>"
+        is_channel = e.target.startswith(("#", "&"))
+        channel_key = e.target if is_channel else "<priv>"
+        # Per-channel default user/repo (robustness fix #13).
+        default_user, default_repo = self._defaults_for(
+            e.target if is_channel else None
+        )
 
         for msg in e.arguments:
             for user, repo, num in self.issue_re.findall(msg):
@@ -298,7 +333,9 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
                     continue
 
                 try:
-                    entity = self.find_entity_from_id(num, user, repo)
+                    entity = self.find_entity_from_id(
+                        num, user or default_user, repo or default_repo,
+                    )
                 except Exception as err:
                     log.exception("API failure for #%s: %s", num, err)
                     continue
@@ -375,7 +412,6 @@ class Issue:
     title: str
     url: str
     date: datetime
-    deleted: bool = False
 
     def render(self):
         return f'Issue by @{sanitize_irc(self.user, 64)} "{sanitize_irc(self.title)}": {self.url}'
@@ -426,10 +462,14 @@ def _author_login(node):
 # ---------------------------------------------------------------------------
 
 
+class GraphQLError(Exception):
+    """Raised when a GraphQL response contains an `errors` array."""
+
+
 class GitHubAPI:
     _GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
 
-    def __init__(self, api_token_path, timeout_sec=5):
+    def __init__(self, api_token_path, timeout_sec=10):
         check_token_file_permissions(api_token_path)
         api_key = self._load_api_key(api_token_path)
         self._session = self._init_session(api_key)
@@ -442,6 +482,19 @@ class GitHubAPI:
     def _init_session(self, api_key):
         session = requests.Session()
         session.headers.update({"Authorization": f"Bearer {api_key}"})
+        # Retry transient HTTP errors (robustness fix #3).
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
         return session
 
     def query(self, query, variables=None):
@@ -451,7 +504,16 @@ class GitHubAPI:
             timeout=self.timeout_sec,
         )
         resp.raise_for_status()
-        return resp.json()
+        body = resp.json()
+        # GraphQL returns 200 with an `errors` array on query problems
+        # (robustness fix #1).
+        errors = body.get("errors")
+        if errors:
+            messages = "; ".join(
+                e.get("message", "?") for e in errors if isinstance(e, dict)
+            )
+            raise GraphQLError(messages or "unknown GraphQL error")
+        return body
 
     def find_by_id(self, id_, user="neomutt", repo="neomutt"):
         variables = {"num": int(id_), "user": user, "repo": repo}
@@ -576,10 +638,32 @@ def parse_args(argv=None):
     )
 
     parser.add_argument(
+        "--channel", dest="extra_channels", action="append", default=[],
+        metavar="NAME[:OWNER/REPO]",
+        help="additional channel to join with optional default github "
+             "owner/repo (may be repeated)",
+    )
+
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="enable debug logging"
     )
 
     return parser.parse_args(argv)
+
+
+def parse_channel_spec(spec, default_user, default_repo):
+    """Parse 'name[:owner/repo]' into (channel, user, repo)."""
+    if ":" in spec:
+        name, slug = spec.split(":", 1)
+        if "/" not in slug:
+            raise ValueError(f"invalid channel spec {spec!r}: expected NAME:OWNER/REPO")
+        owner, repo = slug.split("/", 1)
+    else:
+        name = spec
+        owner, repo = default_user, default_repo
+    if not name.startswith(("#", "&")):
+        name = "#" + name
+    return name, owner, repo
 
 
 def setup_logging(verbose=False):
@@ -588,6 +672,19 @@ def setup_logging(verbose=False):
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+
+
+def install_signal_handlers(bot):
+    """Quit cleanly on SIGTERM / SIGINT (robustness fix #12)."""
+    def handler(signum, frame):
+        log.info("Signal %d received; sending QUIT and shutting down", signum)
+        try:
+            bot.disconnect("shutting down")
+        except Exception:
+            log.exception("Error while disconnecting")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
 
 
 def main():
@@ -610,12 +707,22 @@ def main():
     else:
         port = args.port
 
-    channel = args.channel if args.channel.startswith(("#", "&")) else f"#{args.channel}"
+    primary_channel = (
+        args.channel if args.channel.startswith(("#", "&")) else f"#{args.channel}"
+    )
+    channels = {primary_channel: (args.user, args.repo)}
+    for spec in args.extra_channels:
+        try:
+            name, owner, repo = parse_channel_spec(spec, args.user, args.repo)
+        except ValueError as exc:
+            log.error("%s", exc)
+            sys.exit(2)
+        channels[name] = (owner, repo)
 
     api = GitHubAPI(token_path)
     bot = GitHubBot(
         api,
-        channel,
+        primary_channel,
         args.nickname,
         args.server,
         port,
@@ -626,10 +733,12 @@ def main():
         use_tls=args.tls,
         sasl_login=args.sasl_user,
         sasl_password=sasl_password,
+        channels=channels,
         per_user_lookups_per_min=args.per_user_lookups_per_min,
         per_channel_lookups_per_min=args.per_channel_lookups_per_min,
         send_messages_per_sec=args.send_messages_per_sec,
     )
+    install_signal_handlers(bot)
     bot.start()
 
 
