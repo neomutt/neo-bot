@@ -746,6 +746,61 @@ class TestGraphQLErrors(unittest.TestCase):
         out = api.query("query {}", {})
         self.assertEqual(out, {"data": {"x": 1}})
 
+    def test_partial_errors_with_data_does_not_raise(self):
+        """GitHub union queries return both `data` and partial `errors`
+        (e.g. when looking up a PR by number, the issue/discussion branches
+        return null + an error each)."""
+        api = self._make_api()
+        resp = MagicMock()
+        resp.json.return_value = {
+            "data": {
+                "repository": {
+                    "issue": None,
+                    "pullRequest": {"number": 4861, "title": "x"},
+                    "discussion": None,
+                }
+            },
+            "errors": [
+                {"message": "Could not resolve to an Issue with the number of 4861."},
+                {"message": "Could not resolve to a Discussion with the number of 4861."},
+            ],
+        }
+        resp.raise_for_status = MagicMock()
+        api._session.post.return_value = resp
+        out = api.query("query {}", {})
+        self.assertEqual(out["data"]["repository"]["pullRequest"]["number"], 4861)
+
+    def test_pr_lookup_with_partial_errors_returns_pr(self):
+        """End-to-end through find_by_id: a PR with sibling-branch errors
+        must still return the PR entity (regression test for the crash on
+        looking up PR #4861)."""
+        api = self._make_api()
+        api._session.post.return_value = MagicMock()
+        api._session.post.return_value.raise_for_status = MagicMock()
+        api._session.post.return_value.json.return_value = {
+            "data": {
+                "repository": {
+                    "issue": None,
+                    "pullRequest": {
+                        "number": 4861,
+                        "title": "fix something",
+                        "url": "https://github.com/neomutt/neomutt/pull/4861",
+                        "createdAt": "2024-01-01T00:00:00Z",
+                        "author": {"login": "alice"},
+                    },
+                    "discussion": None,
+                }
+            },
+            "errors": [
+                {"message": "Could not resolve to an Issue with the number of 4861."},
+                {"message": "Could not resolve to a Discussion with the number of 4861."},
+            ],
+        }
+        entity = api.find_by_id(4861, "neomutt", "neomutt")
+        self.assertIsInstance(entity, neo_bot.PullRequest)
+        self.assertEqual(entity.number, 4861)
+        self.assertEqual(entity.user, "alice")
+
 
 # ---------------------------------------------------------------------------
 # Robustness #3: HTTPAdapter retry mounted on the session

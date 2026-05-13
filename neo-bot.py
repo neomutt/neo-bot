@@ -505,14 +505,21 @@ class GitHubAPI:
         )
         resp.raise_for_status()
         body = resp.json()
-        # GraphQL returns 200 with an `errors` array on query problems
+        # GraphQL returns 200 with an `errors` array on query problems.
+        # Many of our queries are unions (issue OR pullRequest OR discussion);
+        # GitHub returns errors for the branches that don't resolve, but
+        # also returns valid `data` for the branch that does.  Only raise
+        # when there is no usable data; otherwise log and continue
         # (robustness fix #1).
-        errors = body.get("errors")
+        errors = body.get("errors") or []
+        has_data = body.get("data") is not None
         if errors:
             messages = "; ".join(
                 e.get("message", "?") for e in errors if isinstance(e, dict)
             )
-            raise GraphQLError(messages or "unknown GraphQL error")
+            if not has_data:
+                raise GraphQLError(messages or "unknown GraphQL error")
+            log.debug("GraphQL partial errors (data still returned): %s", messages)
         return body
 
     def find_by_id(self, id_, user="neomutt", repo="neomutt"):
