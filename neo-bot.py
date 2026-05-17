@@ -248,6 +248,12 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
                 return entry
         return (self.user, self.repo)
 
+    def _reply_target(self, target):
+        """Route every bot reply to a channel target."""
+        if target and target.startswith(("#", "&")):
+            return target
+        return self.channel or target
+
     @staticmethod
     def _make_connect_factory(use_tls, server):
         if not use_tls:
@@ -270,15 +276,10 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
             c.join(chan)
 
     def on_privmsg(self, c, e):
-        # Reply to the source nick, never leak private queries to the channel.
-        return self._process_message(c, e.source.nick, e)
+        return self._process_message(c, e.target, e)
 
     def on_action(self, c, e):
-        if e.target == c.get_nickname():
-            respond_to = e.source.nick
-        else:
-            respond_to = e.target
-        return self._process_message(c, respond_to, e)
+        return self._process_message(c, e.target, e)
 
     def on_pubmsg(self, c, e):
         return self._process_message(c, e.target, e)
@@ -315,6 +316,7 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
         source_nick = getattr(e.source, "nick", None) or "?"
         is_channel = e.target.startswith(("#", "&"))
         channel_key = e.target if is_channel else "<priv>"
+        reply_target = self._reply_target(answer_to)
         # Per-channel default user/repo (robustness fix #13).
         default_user, default_repo = self._defaults_for(
             e.target if is_channel else None
@@ -348,7 +350,7 @@ class GitHubBot(irc.bot.SingleServerIRCBot):
                     log.info(reject)
                     continue
 
-                self._send_throttled(c, answer_to, entity.render())
+                self._send_throttled(c, reply_target, entity.render())
 
     def _send_throttled(self, c, target, text):
         """Throttle outgoing messages to avoid IRC server flood-kill (#6)."""

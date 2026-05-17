@@ -310,8 +310,8 @@ class TestBotBehavior(unittest.TestCase):
         bot._channels = {"#neomutt": ("neomutt", "neomutt")}
         return bot
 
-    def test_privmsg_replies_to_source_not_channel(self):
-        """Bug #6: on_privmsg used to leak to self.channel."""
+    def test_privmsg_replies_to_primary_channel(self):
+        """Private messages are echoed to the configured channel."""
         bot = self._make_bot()
         bot.api.find_by_id.return_value = neo_bot.Issue(
             number=1,
@@ -330,8 +330,29 @@ class TestBotBehavior(unittest.TestCase):
         bot.on_privmsg(c, e)
         c.privmsg.assert_called_once()
         target, _ = c.privmsg.call_args[0]
-        self.assertEqual(target, "alice")
-        self.assertNotEqual(target, "#neomutt")
+        self.assertEqual(target, "#neomutt")
+
+    def test_private_action_replies_to_primary_channel(self):
+        """Direct CTCP ACTION lookups are echoed to the configured channel."""
+        bot = self._make_bot()
+        bot.api.find_by_id.return_value = neo_bot.Issue(
+            number=1,
+            user="alice",
+            title="hi",
+            url="https://example.com/1",
+            date=datetime.datetime.now(datetime.timezone.utc),
+        )
+        c = MagicMock()
+        c.get_nickname.return_value = "neo-bot"
+        e = MagicMock()
+        e.arguments = ["#1"]
+        e.source.nick = "alice"
+        e.target = "neo-bot"
+
+        bot.on_action(c, e)
+        c.privmsg.assert_called_once()
+        target, _ = c.privmsg.call_args[0]
+        self.assertEqual(target, "#neomutt")
 
     def test_too_old_blocked_without_mention(self):
         """Bug #5/#9: aged issues without explicit mention are rejected."""

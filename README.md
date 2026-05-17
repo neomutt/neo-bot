@@ -50,6 +50,9 @@ group/world-accessible.  All issue titles, author logins and discussion
 emoji are sanitized to strip control characters (CTCP, colour codes,
 CRLF) before being sent to IRC.
 
+Bot replies are always posted to a channel target. Private lookups and
+direct `/me` actions are echoed to the primary configured channel.
+
 ### Example
 
 ```bash
